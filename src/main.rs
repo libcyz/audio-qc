@@ -420,13 +420,15 @@ impl eframe::App for App {
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(12, 22))
                 .show(ui, |ui| {
+                    // 高度固定, 内容行数变化时面板不跟着长高 —— 否则上面板一变高,
+                    // 下面的表格视口就变, 又会牵动布局
+                    ui.set_min_height(52.0);
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new(drop_text).size(17.0));
                         if !self.hint.is_empty() && !self.busy {
                             ui.label(egui::RichText::new("可以继续拖下一批").weak());
                         }
                     });
-                    ui.set_min_width(ui.available_width());
                 });
 
             ui.add_space(8.0);
@@ -501,6 +503,10 @@ impl eframe::App for App {
 mod result_table {
     use eframe::egui;
 
+    /// 最后一列(原因/备注)的固定宽度。全部列定宽 = 表格总宽是确定的,
+    /// 不随视口和滚动条变化, 才不会和 ScrollArea 互相拉扯。
+    const WHY_W: f32 = 460.0;
+
     const HEADS: [(&str, f32); 6] = [
         ("文件名", 260.0),
         ("格式", 46.0),
@@ -520,7 +526,7 @@ mod result_table {
                         ui.add_sized([w, 18.0], egui::Label::new(egui::RichText::new(h).strong()).truncate());
                     }
                     ui.add_sized([46.0, 18.0], egui::Label::new(egui::RichText::new("结论").strong()));
-                    ui.label(egui::RichText::new("原因 / 备注").strong());
+                    ui.add_sized([WHY_W, 18.0], egui::Label::new(egui::RichText::new("原因 / 备注").strong()));
                     ui.end_row();
 
                     for r in rows {
@@ -551,9 +557,16 @@ mod result_table {
                         } else {
                             format!("{why}；{note}")
                         };
-                        ui.add(egui::Label::new(egui::RichText::new(&text).color(
-                            if ok { ui.visuals().weak_text_color() } else { color },
-                        )).truncate())
+                        // 必须定宽: truncate() 会去要"可用宽度", 而在可横向滚动的
+                        // ScrollArea 里, 可用宽度又取决于滚动条在不在 —— 两者每帧
+                        // 互相追逐, 表现出来就是窗口一直闪。
+                        ui.add_sized(
+                            [WHY_W, 18.0],
+                            egui::Label::new(egui::RichText::new(&text).color(
+                                if ok { ui.visuals().weak_text_color() } else { color },
+                            ))
+                            .truncate(),
+                        )
                         .on_hover_text(&text);
                         ui.end_row();
                     }

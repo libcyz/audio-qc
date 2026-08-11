@@ -5,7 +5,14 @@ edition = "2024"
 
 [dependencies]
 csv = "1.4.0"
-eframe = "0.36.1"
+# 默认后端是 wgpu(Windows 上走 DX12), 某些显卡驱动下整个画面会闪。
+# 换成 glow(OpenGL) 后端, 顺带少编译一大堆 wgpu 依赖。
+eframe = { version = "0.36.1", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }
 egui = "0.36.1"
 rfd = "0.17.2"
 rustfft = "6.4.1"
