@@ -631,32 +631,30 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
             song_fails.push(format!("人声伴奏分贝差{v:+.1}dB超出[-15,10]"));
         }
     }
+    // 备注只写"异常和额外信息", 正常情况下应该短到一眼扫过。
     match rev {
         Some(v) => {
-            song_notes.push(format!("RT60={:.2}s({}段衰减)", v.median, v.segments));
+            song_notes.push(format!("RT60 {:.2}s", v.median));
             if v.median >= RT60_S {
-                // 证据薄的时候说清楚, 免得靠一个"看着很确定"的数字去退货
+                // 证据薄的时候提一句, 免得靠一个"看着很确定"的数字去退货
                 let weak = if v.is_thin() {
-                    format!("(仅{}段衰减, 其中{}段超标, 建议人工复核)", v.segments, v.over_limit)
+                    format!("(仅{}段, 建议复核)", v.segments)
                 } else {
                     String::new()
                 };
                 song_fails.push(format!("RT60={:.2}s>=0.3s{weak}", v.median));
             }
         }
-        None => song_notes.push("RT60无有效衰减段, 未判定".into()),
+        None => song_notes.push("RT60未测出".into()),
     }
-    let miss: Vec<&str> = [
-        ("人声活动比例", voc_act.is_none()),
-        ("伴奏活动比例", ins_act.is_none()),
-        ("人声伴奏分贝差", diff.is_none()),
-    ]
-    .iter()
-    .filter(|(_, m)| *m)
-    .map(|(n, _)| *n)
-    .collect();
+    // 空着的那几列已经说明"没测", 这里只需点出是缺哪条轨, 不用把指标名列一遍
+    let miss: Vec<&str> = [("人声轨", voc.is_none()), ("伴奏轨", ins.is_none())]
+        .iter()
+        .filter(|(_, m)| *m)
+        .map(|(n, _)| *n)
+        .collect();
     if !miss.is_empty() {
-        song_notes.push(format!("未校验{}(缺对应音轨)", miss.join("/")));
+        song_notes.push(format!("无{}", miss.join("和")));
     }
 
     let mut rows = Vec::new();
@@ -690,14 +688,14 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
             fails.push(format!("码率{:.0}kbps<320", t.bitrate));
         }
         match t.cutoff {
-            None => notes.push("截止频率无法估计".into()),
+            None => notes.push("截止频率未测出".into()),
             Some(c) if c < CUTOFF_HZ => {
                 fails.push(format!("截止频率{:.1}kHz<15kHz", c / 1000.0))
             }
             Some(_) => {}
         }
         match t.noise {
-            None => notes.push("无静音段(全程有声), 底噪测不出, 未判定".into()),
+            None => notes.push("底噪未测(无静音段)".into()),
             Some(nf) if nf >= NOISE_DBFS => fails.push(format!("底噪{nf:.1}dBFS高于-40")),
             Some(_) => {}
         }
