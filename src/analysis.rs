@@ -634,7 +634,8 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
     // 备注只写"异常和额外信息", 正常情况下应该短到一眼扫过。
     match rev {
         Some(v) => {
-            song_notes.push(format!("RT60 {:.2}s", v.median));
+            // 括号里点明含义: 看表的人未必知道 RT60 是什么
+            song_notes.push(format!("RT60 {:.2}s(混响时间)", v.median));
             if v.median >= RT60_S {
                 // 证据薄的时候提一句, 免得靠一个"看着很确定"的数字去退货
                 let weak = if v.is_thin() {
@@ -642,10 +643,10 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
                 } else {
                     String::new()
                 };
-                song_fails.push(format!("RT60={:.2}s>=0.3s{weak}", v.median));
+                song_fails.push(format!("混响时间RT60={:.2}s>=0.3s{weak}", v.median));
             }
         }
-        None => song_notes.push("RT60未测出".into()),
+        None => song_notes.push("RT60未测出(混响时间)".into()),
     }
     // 空着的那几列已经说明"没测", 这里只需点出是缺哪条轨, 不用把指标名列一遍
     let miss: Vec<&str> = [("人声轨", voc.is_none()), ("伴奏轨", ins.is_none())]
