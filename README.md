@@ -20,9 +20,13 @@
 
 去 [Releases](../../releases) 拿对应平台的包，或者在 Actions 里下最新构建产物。
 
-- **macOS**：`AudioQC-macOS.zip`，解压得到 `AudioQC.app`（通用二进制，Intel 和 M 系列都能跑）。
-  首次打开提示"无法验证开发者"是正常的（未签名），右键点图标选**打开**即可，
-  或终端执行 `xattr -dr com.apple.quarantine AudioQC.app`。
+- **macOS**：`AudioQC-macOS.dmg`（通用二进制，Intel 和 M 系列都能跑）。双击挂载，
+  把弹出窗口里的 `AudioQC.app` 拖进 `Applications` 即可——**别点进 App 包内部**，
+  直接拖那一个图标。首次打开提示"无法验证开发者"是正常的（未签名），
+  右键点图标选**打开**即可，或终端执行 `xattr -dr com.apple.quarantine AudioQC.app`。
+  > 用 IM 工具（微信等）转发给同事时也要发整个 `.app` 或这个 `.dmg`，
+  > 不要从包内单独拷出可执行文件——那样对方双击时会被系统当成未知文件，
+  > 交给文本编辑器打开，报"文本编码不适用"的错误。
 - **Windows**：`AudioQC.exe`，单文件直接双击。
 - **Linux**：`AudioQC-linux`，`chmod +x` 后运行。
 
