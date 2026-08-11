@@ -1,0 +1,112 @@
+name: build
+
+# 手动点一下、推 main、或者打 v* 标签, 都会出包。
+# macOS 那台是苹果自己的云端机器, 所以不需要你有 Mac。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-14          # Apple Silicon 机器, 两个架构都能编
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 算法自检
+        run: cargo test --release
+
+      - name: 编译两个架构
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: 合成通用二进制并打成 .app
+        run: |
+          mkdir -p AudioQC.app/Contents/MacOS
+          # lipo 把两个架构合成一个文件, Intel 和 M 系列 Mac 都能跑
+          lipo -create -output AudioQC.app/Contents/MacOS/AudioQC \
+            target/aarch64-apple-darwin/release/audio_qc \
+            target/x86_64-apple-darwin/release/audio_qc
+          cp packaging/Info.plist AudioQC.app/Contents/Info.plist
+          chmod +x AudioQC.app/Contents/MacOS/AudioQC
+          lipo -info AudioQC.app/Contents/MacOS/AudioQC
+          # 用 ditto 打包, 解压后可执行位还在 (普通 zip 会丢)
+          ditto -c -k --keepParent AudioQC.app AudioQC-macOS.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioQC-macOS
+          path: AudioQC-macOS.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 算法自检
+        run: cargo test --release
+      - name: 编译
+        run: cargo build --release
+      - name: 改个名
+        run: Copy-Item target/release/audio_qc.exe AudioQC.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioQC-Windows
+          path: AudioQC.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 装 GUI 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev
+      - name: 算法自检
+        run: cargo test --release
+      - name: 编译
+        run: cargo build --release
+      - run: cp target/release/audio_qc AudioQC-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioQC-Linux
+          path: AudioQC-linux
+
+  # 打了 v1.0 这类标签时, 顺手发一个 Release, 三个平台的包直接挂上去
+  release:
+    needs: [macos, windows, linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            AudioQC-macOS/AudioQC-macOS.zip
+            AudioQC-Windows/AudioQC.exe
+            AudioQC-Linux/AudioQC-linux
+          body: |
+            音频实录质量校验工具
+
+            - macOS: 下载 AudioQC-macOS.zip，解压得到 AudioQC.app。
+              首次打开会提示"无法验证开发者"——右键点图标选"打开"即可
+              （或终端跑 `xattr -dr com.apple.quarantine AudioQC.app`）。
+              这是未签名二进制的正常提示，要消除需要 Apple 开发者证书。
+            - Windows: 直接下载 AudioQC.exe。
+            - Linux: 下载 AudioQC-linux，`chmod +x` 后运行。
+
+            用法：把音频文件或文件夹拖进窗口，结果 CSV 写在拖进来的位置旁边。
