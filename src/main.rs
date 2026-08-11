@@ -18,7 +18,8 @@ const MAX_SCAN_FILES: usize = 5000;   // 防呆: 拖进来一整个盘时别无�
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 660.0])
+            // 放得下 12 列(总宽约 1640)又不至于超出常见屏幕
+            .with_inner_size([1280.0, 700.0])
             .with_min_inner_size([760.0, 480.0])
             .with_drag_and_drop(true)
             .with_title("音频实录质量校验"),
@@ -503,18 +504,27 @@ impl eframe::App for App {
 mod result_table {
     use eframe::egui;
 
-    /// 最后一列(原因/备注)的固定宽度。全部列定宽 = 表格总宽是确定的,
-    /// 不随视口和滚动条变化, 才不会和 ScrollArea 互相拉扯。
-    const WHY_W: f32 = 460.0;
-
-    const HEADS: [(&str, f32); 6] = [
-        ("文件名", 260.0),
-        ("格式", 46.0),
-        ("时长", 56.0),
-        ("码率", 60.0),
-        ("底噪", 62.0),
-        ("截止", 58.0),
+    /// 每列宽度, 与 analysis::COLUMNS 一一对应 —— 界面显示的字段必须和 csv 完全一致,
+    /// 不另起一套简称。全部定宽: truncate() 会去索取"可用宽度", 而在可横向滚动的
+    /// ScrollArea 里可用宽度又取决于滚动条在不在, 两者每帧互相追逐, 窗口就会闪。
+    const WIDTHS: [f32; 12] = [
+        250.0, // 文件名
+        48.0,  // 格式
+        62.0,  // 采样率
+        56.0,  // 时长
+        72.0,  // 码率kbps
+        72.0,  // 底噪dBFS
+        84.0,  // 截至频率Khz
+        86.0,  // 人声活动比例
+        86.0,  // 伴奏活动比例
+        98.0,  // 人声伴奏分贝差
+        300.0, // 是否满足要求
+        320.0, // 备注（如有）
     ];
+
+    const VERDICT: usize = 10;   // "是否满足要求" 在第几列
+    const GREEN: egui::Color32 = egui::Color32::from_rgb(26, 127, 55);
+    const RED: egui::Color32 = egui::Color32::from_rgb(179, 38, 30);
 
     pub fn table(ui: &mut egui::Ui, rows: &[Vec<String>]) {
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
@@ -522,52 +532,27 @@ mod result_table {
                 .striped(true)
                 .spacing([10.0, 6.0])
                 .show(ui, |ui| {
-                    for (h, w) in HEADS {
-                        ui.add_sized([w, 18.0], egui::Label::new(egui::RichText::new(h).strong()).truncate());
+                    for (h, w) in super::COLUMNS.iter().zip(WIDTHS) {
+                        ui.add_sized(
+                            [w, 18.0],
+                            egui::Label::new(egui::RichText::new(*h).strong()).truncate(),
+                        );
                     }
-                    ui.add_sized([46.0, 18.0], egui::Label::new(egui::RichText::new("结论").strong()));
-                    ui.add_sized([WHY_W, 18.0], egui::Label::new(egui::RichText::new("原因 / 备注").strong()));
                     ui.end_row();
 
                     for r in rows {
-                        // 列顺序: 0文件名 1格式 2采样率 3时长 4码率 5底噪 6截止 ... 10结论 11备注
-                        for (i, (_, w)) in [0usize, 1, 3, 4, 5, 6].iter().zip(HEADS) {
-                            ui.add_sized(
-                                [w, 18.0],
-                                egui::Label::new(r.get(*i).cloned().unwrap_or_default()).truncate(),
-                            )
-                            .on_hover_text(r.get(*i).cloned().unwrap_or_default());
+                        let ok = r.get(VERDICT).map(|v| v == "是").unwrap_or(false);
+                        for (i, w) in WIDTHS.iter().enumerate() {
+                            let cell = r.get(i).cloned().unwrap_or_default();
+                            let mut text = egui::RichText::new(&cell);
+                            if i == VERDICT {
+                                text = text.color(if ok { GREEN } else { RED }).strong();
+                            } else if i == VERDICT + 1 {
+                                text = text.color(ui.visuals().weak_text_color());
+                            }
+                            ui.add_sized([*w, 18.0], egui::Label::new(text).truncate())
+                                .on_hover_text(&cell);   // 列窄看不全时鼠标悬停看全文
                         }
-                        let ok = r.get(10).map(|v| v == "是").unwrap_or(false);
-                        let (verdict, color) = if ok {
-                            ("是", egui::Color32::from_rgb(26, 127, 55))
-                        } else {
-                            ("否", egui::Color32::from_rgb(179, 38, 30))
-                        };
-                        ui.add_sized(
-                            [46.0, 18.0],
-                            egui::Label::new(egui::RichText::new(verdict).color(color).strong()),
-                        );
-                        let why = r.get(10).map(|v| v.trim_start_matches("否：").to_string()).unwrap_or_default();
-                        let note = r.get(11).cloned().unwrap_or_default();
-                        let text = if ok {
-                            note
-                        } else if note.is_empty() {
-                            why
-                        } else {
-                            format!("{why}；{note}")
-                        };
-                        // 必须定宽: truncate() 会去要"可用宽度", 而在可横向滚动的
-                        // ScrollArea 里, 可用宽度又取决于滚动条在不在 —— 两者每帧
-                        // 互相追逐, 表现出来就是窗口一直闪。
-                        ui.add_sized(
-                            [WHY_W, 18.0],
-                            egui::Label::new(egui::RichText::new(&text).color(
-                                if ok { ui.visuals().weak_text_color() } else { color },
-                            ))
-                            .truncate(),
-                        )
-                        .on_hover_text(&text);
                         ui.end_row();
                     }
                 });
