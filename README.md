@@ -26,17 +26,6 @@
 - **Windows**：`AudioQC.exe`，单文件直接双击。
 - **Linux**：`AudioQC-linux`，`chmod +x` 后运行。
 
-## 自己编译
-
-```bash
-cargo build --release       # 产物 target/release/audio_qc
-cargo test --release        # 6 项算法自检
-cargo run --release -- /path/to/音频目录    # 也可以直接传路径
-```
-
-依赖全是纯 Rust（symphonia 解码、rustfft 频谱、egui 界面），
-**不需要 ffmpeg**，不需要任何系统运行时。
-
 ## 几个指标的说明
 
 - **底噪**取整段音频静音部分的能量平均（静音段 = 活动门限以下、且高于 −90 dBFS 的帧，
