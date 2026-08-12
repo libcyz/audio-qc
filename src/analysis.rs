@@ -10,9 +10,9 @@ use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 // ---- CSV 表头 (交付方规定, 顺序不要动) --------------------------------------
-pub const COLUMNS: [&str; 14] = [
+pub const COLUMNS: [&str; 15] = [
     "文件名", "格式", "采样率", "时长", "码率kbps", "底噪dBFS", "截至频率Khz",
-    "人声活动比例", "伴奏活动比例", "人声伴奏分贝差", "峰值电平", "是否削波",
+    "人声活动比例", "伴奏活动比例", "人声伴奏分贝差", "峰值电平", "平均幅值", "是否削波",
     "是否满足要求", "备注（如有）",
 ];
 // "是否满足要求"/"备注" 永远是最后两列, 用相对位置算下标 —— 以后再插新列
@@ -29,8 +29,9 @@ pub const CUTOFF_HZ: f64 = 15000.0;      // 截止频率 >=
 pub const BITRATE_KBPS: f64 = 320.0;     // 码率 >=
 pub const NOISE_DBFS: f64 = -40.0;       // 底噪 <
 pub const RT60_S: f64 = 0.30;            // RT60 <
-pub const PEAK_DB_LO: f64 = -8.0;        // 动态范围控制: 峰值电平下限
-pub const PEAK_DB_HI: f64 = -3.0;        // 上限
+pub const PEAK_DB_MAX: f64 = -1.0;       // 峰值电平: 不超过这个值(没有下限)
+pub const AVG_DB_LO: f64 = -8.0;         // 平均幅值(整轨 RMS): 下限
+pub const AVG_DB_HI: f64 = -3.0;         // 上限
 // 削波判定阈值。这里踩过一个坑, 记录一下取舍:
 //
 // 第一版按"贴不贴这个文件自己的峰值"(相对阈值)算, 想解决"削波发生在数字化之前
@@ -766,10 +767,15 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
         }
         match t.peak_db {
             None => notes.push("峰值电平未测出".into()),
-            Some(pk) if !(PEAK_DB_LO..=PEAK_DB_HI).contains(&pk) => {
-                fails.push(format!("峰值电平{pk:.1}dBFS超出[-8,-3]"))
+            Some(pk) if pk > PEAK_DB_MAX => {
+                fails.push(format!("峰值电平{pk:.1}dBFS超过{PEAK_DB_MAX}dBFS"))
             }
             Some(_) => {}
+        }
+        // 平均幅值 = 整轨 RMS(t.rms), 跟峰值电平是两回事: 峰值管"顶没顶到头",
+        // 平均幅值管"整体响不响"——同一个峰值下, 平均幅值越高说明动态压得越死。
+        if !(AVG_DB_LO..=AVG_DB_HI).contains(&t.rms) {
+            fails.push(format!("平均幅值{:.1}dBFS超出[{AVG_DB_LO},{AVG_DB_HI}]", t.rms));
         }
         // 削波是硬性禁止项, 跟峰值范围分开报: 峰值超标只是"响", 削波是"failed 已经失真"。
         // 一个文件出现削波时峰值必然也贴着 0dBFS、峰值检查本来就会一起不合格,
@@ -790,6 +796,7 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
             ins_act.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_default(),
             fmt_opt(diff, 1),
             fmt_opt(t.peak_db, 1),
+            format!("{:.1}", t.rms),
             if t.clip_events > 0 { format!("是({}处)", t.clip_events) } else { "否".into() },
             if fails.is_empty() { "是".into() } else { format!("否：{}", fails.join("；")) },
             notes.join("；"),
