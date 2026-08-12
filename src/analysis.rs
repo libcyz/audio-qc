@@ -30,7 +30,7 @@ pub const BITRATE_KBPS: f64 = 320.0;     // 码率 >=
 pub const NOISE_DBFS: f64 = -40.0;       // 底噪 <
 pub const RT60_S: f64 = 0.30;            // RT60 <
 pub const PEAK_DB_MAX: f64 = -1.0;       // 峰值电平: 不超过这个值(没有下限)
-pub const AVG_DB_LO: f64 = -8.0;         // 平均幅值(整轨 RMS): 下限
+pub const AVG_DB_LO: f64 = -8.0;         // 平均幅值(活动段 RMS): 下限
 pub const AVG_DB_HI: f64 = -3.0;         // 上限
 // 削波判定阈值。这里踩过一个坑, 记录一下取舍:
 //
@@ -268,6 +268,37 @@ pub fn rms_db(x: &[f64]) -> f64 {
         return f64::NAN;
     }
     10.0 * (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + 1e-20).log10()
+}
+
+/// 平均幅值(RMS, dB), 只算活动段的采样。"活动/静音"的判断标准复用
+/// active_threshold(简单的能量阈值 VAD): 跟活动比例、底噪同一套逻辑,
+/// 不然安静的前奏尾奏、句间停顿会被一起摊进整段平均, 拉低读数,
+/// 显得录音比实际更"温"。
+///
+/// db 是调用方已经算好的逐帧包络(frame_db 的结果), 这里复用, 不重复算一遍;
+/// 每个活跃帧只计入 HOP 那部分采样(不是整个 WIN 窗口), 跟 active_seconds 数
+/// 时长的口径保持一致 —— 帧与帧之间有重叠, 按 WIN 算会把重叠区间重复计数。
+fn active_rms_db(x: &[f64], sr: u32, db: &[f64]) -> f64 {
+    if db.is_empty() {
+        return rms_db(x);   // 太短测不出包络, 退回整段算
+    }
+    let thr = active_threshold(db);
+    let hop = (sr as f64 * HOP) as usize;
+    let mut sum_sq = 0.0f64;
+    let mut n = 0usize;
+    for (k, &d) in db.iter().enumerate() {
+        if d <= thr {
+            continue;
+        }
+        let s = k * hop;
+        let e = (s + hop).min(x.len());
+        sum_sq += x[s..e].iter().map(|v| v * v).sum::<f64>();
+        n += e - s;
+    }
+    if n == 0 {
+        return rms_db(x);   // 极端情况全曲没有一帧判定为活跃, 保险退回整段算
+    }
+    10.0 * (sum_sq / n as f64 + 1e-20).log10()
 }
 
 /// 峰值电平(dBFS) = 20*log10(最大绝对采样值)。真静音(peak=0)时没有意义, 返回 None。
@@ -524,7 +555,7 @@ pub fn analyse(path: &Path) -> Result<Track, String> {
         // 码率用 文件字节数/时长 实测: 对 wav 和 mp3 都成立, 且 VBR 拿到的是真实均值
         bitrate: size as f64 * 8.0 / dur / 1000.0,
         active_s: active_seconds(&db),
-        rms: rms_db(&d.mono),
+        rms: active_rms_db(&d.mono, d.sr, &db),
         noise,
         cutoff: cutoff_hz(&d.mono, d.sr),
         rt60: rt60(&db, noise),
@@ -772,7 +803,7 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
             }
             Some(_) => {}
         }
-        // 平均幅值 = 整轨 RMS(t.rms), 跟峰值电平是两回事: 峰值管"顶没顶到头",
+        // 平均幅值 = 活动段 RMS(t.rms), 跟峰值电平是两回事: 峰值管"顶没顶到头",
         // 平均幅值管"整体响不响"——同一个峰值下, 平均幅值越高说明动态压得越死。
         if !(AVG_DB_LO..=AVG_DB_HI).contains(&t.rms) {
             fails.push(format!("平均幅值{:.1}dBFS超出[{AVG_DB_LO},{AVG_DB_HI}]", t.rms));
@@ -835,6 +866,26 @@ mod tests {
         x.extend(noise(5 * sr as usize, 1e-4, 7));
         let ratio = active_seconds(&frame_db(&x, sr)) / 10.0;
         assert!((0.48..0.52).contains(&ratio), "活动比例 {ratio}");
+    }
+
+    #[test]
+    fn active_rms_ignores_silence() {
+        let sr = 48000;
+        // 5秒响的正弦 + 5秒近乎数字静音的尾巴
+        let mut x = sine(sr, 5.0, 440.0, 0.5);
+        x.extend(noise(5 * sr as usize, 1e-4, 42));
+        let db = frame_db(&x, sr);
+        let whole = rms_db(&x);
+        let active = active_rms_db(&x, sr, &db);
+        let sine_only = rms_db(&sine(sr, 5.0, 440.0, 0.5));
+        assert!(
+            (active - sine_only).abs() < 1.0,
+            "只算活动段应接近纯响段自身RMS, active={active} sine_only={sine_only}"
+        );
+        assert!(
+            active > whole + 2.0,
+            "活动段RMS应明显高于被静音拉低的整段RMS, active={active} whole={whole}"
+        );
     }
 
     #[test]
