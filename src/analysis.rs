@@ -31,7 +31,20 @@ pub const NOISE_DBFS: f64 = -40.0;       // 底噪 <
 pub const RT60_S: f64 = 0.30;            // RT60 <
 pub const PEAK_DB_LO: f64 = -3.0;        // 动态范围控制: 峰值电平下限
 pub const PEAK_DB_HI: f64 = -1.0;        // 上限
-const CLIP_THRESHOLD: f64 = 0.999;       // 触顶判定, 留一点余量给量化噪声/有损编码重建误差
+// 削波判定阈值。这里踩过一个坑, 记录一下取舍:
+//
+// 第一版按"贴不贴这个文件自己的峰值"(相对阈值)算, 想解决"削波发生在数字化之前
+// (话筒前级过载), 到 ADC 时还留着几个 dB 余量, 波形已经削平但采样值没到满量程"
+// 这种漏检。结果在真实素材上大批量误报: 任何平滑波峰(不管削没削波)在接近顶点
+// 时导数天然趋近于零, 连续好几个采样贴着"这段波形自己的峰值"是数学必然, 频率
+// 越低(贝斯、鼓)越明显, 跟削波毫无关系。改完之后正常母带(混音轨习惯贴近 0dB
+// 是行业惯例)反而被大量错判, 比如一首正常歌从 0 处误报炸到 4000+ 处。
+//
+// 现在退回绝对阈值, 只是比原来的 0.999(-0.0087dB)略微放宽到 -0.5dB, 给"前级
+// 削波但数字域还有点余量"的常见情况留一点容差。代价是: 如果削波发生得更早、
+// 后面又被大幅降过增益, 峰值远低于 0dB, 这种更极端的情况还是测不出来 —— 两难
+// 之间选了误报率更低的一边。
+const CLIP_THRESHOLD: f64 = 0.9441;      // -0.5dBFS
 const CLIP_MIN_RUN: usize = 3;           // 连续触顶达到这个采样数才算削波; 1~2个可能只是自然的峰值瞬间
 
 // ---- 分析参数 ---------------------------------------------------------------
@@ -144,7 +157,7 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
                         s += v;
                         sum_sq_all += v * v;
                         peak = peak.max(v.abs());
-                        if clip_step(&mut clip_run[ch], v) {
+                        if clip_step(&mut clip_run[ch], v, CLIP_THRESHOLD) {
                             clip_events += 1;
                         }
                     }
@@ -262,14 +275,13 @@ fn peak_dbfs(peak: f64) -> Option<f64> {
 }
 
 /// 单声道的单个采样触顶检测: run 是调用方持有的"该声道当前连续触顶计数",
-/// 每来一个采样调用一次并原地更新; 连续触顶数刚好达到 CLIP_MIN_RUN 时返回
-/// true(新增一次削波事件), 之后同一段继续触顶不会重复计数。
-/// 只认"连续多个采样顶到满量程"这种硬削波; 孤立 1~2 个触顶采样可能只是
-/// 正常的瞬时峰值, 不算削波 —— 也正因为看的是"顶到满量程", 如果这段音频后来
-/// 被整体降过增益(削波后又标准化), 削平的痕迹会跟着降下去, 就测不出来了;
-/// 这是所有基于交付文件本身检测削波的工具共同的局限, 不是这里独有的。
-fn clip_step(run: &mut usize, sample: f64) -> bool {
-    if sample.abs() >= CLIP_THRESHOLD {
+/// threshold 是绝对幅度门槛(见 CLIP_THRESHOLD 上面那段注释, 记录了为什么最终
+/// 选了绝对阈值而不是相对这个文件自己峰值算)。连续触顶数刚好达到 CLIP_MIN_RUN
+/// 时返回 true(新增一次削波事件), 之后同一段继续触顶不重复计数。只认"连续
+/// 多个采样顶到满量程附近"这种硬削波; 孤立 1~2 个触顶采样可能只是正常的瞬时
+/// 峰值, 不算削波。
+fn clip_step(run: &mut usize, sample: f64, threshold: f64) -> bool {
+    if sample.abs() >= threshold {
         *run += 1;
         *run == CLIP_MIN_RUN
     } else {
@@ -899,7 +911,7 @@ mod tests {
         let mut events = 0usize;
         // 触顶2次(不够3连续, 不算) / 触顶3连续(算1次) / 触顶4连续(还是只算1次, 不重复计数)
         for v in [0.5, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0] {
-            if clip_step(&mut run, v) {
+            if clip_step(&mut run, v, CLIP_THRESHOLD) {
                 events += 1;
             }
         }
@@ -909,11 +921,22 @@ mod tests {
         let mut run = 0usize;
         let mut events = 0usize;
         for v in [0.3, 1.0, 0.2, 1.0, 0.1] {
-            if clip_step(&mut run, v) {
+            if clip_step(&mut run, v, CLIP_THRESHOLD) {
                 events += 1;
             }
         }
         assert_eq!(events, 0, "孤立触顶采样不算削波");
+
+        // -0.5dB 阈值应该比原来的 0.999(-0.0087dB) 松: 贴近但没完全触顶满量程
+        // 的连续采样也该算削波, 这是这次放宽阈值要解决的场景。
+        let mut run = 0usize;
+        let mut events = 0usize;
+        for v in [0.5, 0.95, 0.95, 0.95, 0.5] {
+            if clip_step(&mut run, v, CLIP_THRESHOLD) {
+                events += 1;
+            }
+        }
+        assert_eq!(events, 1, "贴近但没完全顶满的连续采样也该算削波");
     }
 
     #[test]
