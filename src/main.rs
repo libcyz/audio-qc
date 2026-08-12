@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-use analysis::{check_song, group_audio, SongGroup, AUDIO_EXT, COLUMNS};
+use analysis::{check_song, group_audio, SongGroup, AUDIO_EXT, COLUMNS, NOTES_COL};
 use eframe::egui;
 
 const MAX_SCAN_FILES: usize = 5000;   // 防呆: 拖进来一整个盘时别无限扫下去
@@ -169,7 +169,7 @@ fn worker(
         }
         let _ = tx.send(Msg::Status(format!("({}/{}) {}", i + 1, total, g.title)));
         let rows = check_song(g, root.as_deref());
-        if rows.iter().any(|r| r[10] != "是") {
+        if rows.iter().any(|r| r[analysis::VERDICT_COL] != "是") {
             bad_songs += 1;
         }
         all.extend(rows.clone());
@@ -507,7 +507,7 @@ mod result_table {
     /// 每列宽度, 与 analysis::COLUMNS 一一对应 —— 界面显示的字段必须和 csv 完全一致,
     /// 不另起一套简称。全部定宽: truncate() 会去索取"可用宽度", 而在可横向滚动的
     /// ScrollArea 里可用宽度又取决于滚动条在不在, 两者每帧互相追逐, 窗口就会闪。
-    const WIDTHS: [f32; 12] = [
+    const WIDTHS: [f32; 14] = [
         250.0, // 文件名
         48.0,  // 格式
         62.0,  // 采样率
@@ -518,11 +518,15 @@ mod result_table {
         86.0,  // 人声活动比例
         86.0,  // 伴奏活动比例
         98.0,  // 人声伴奏分贝差
+        90.0,  // 动态范围控制
+        84.0,  // 是否削波
         300.0, // 是否满足要求
         320.0, // 备注（如有）
     ];
 
-    const VERDICT: usize = 10;   // "是否满足要求" 在第几列
+    // 与 analysis::VERDICT_COL 保持一致 —— 那边用 COLUMNS.len()-2 算, 这里跟着算,
+    // 免得又留一个写死的数字。
+    const VERDICT: usize = super::COLUMNS.len() - 2;
     const GREEN: egui::Color32 = egui::Color32::from_rgb(26, 127, 55);
     const RED: egui::Color32 = egui::Color32::from_rgb(179, 38, 30);
 
@@ -547,7 +551,7 @@ mod result_table {
                             let mut text = egui::RichText::new(&cell);
                             if i == VERDICT {
                                 text = text.color(if ok { GREEN } else { RED }).strong();
-                            } else if i == VERDICT + 1 {
+                            } else if i == super::NOTES_COL {
                                 text = text.color(ui.visuals().weak_text_color());
                             }
                             ui.add_sized([*w, 18.0], egui::Label::new(text).truncate())

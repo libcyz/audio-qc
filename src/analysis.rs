@@ -10,10 +10,15 @@ use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 // ---- CSV 表头 (交付方规定, 顺序不要动) --------------------------------------
-pub const COLUMNS: [&str; 12] = [
+pub const COLUMNS: [&str; 14] = [
     "文件名", "格式", "采样率", "时长", "码率kbps", "底噪dBFS", "截至频率Khz",
-    "人声活动比例", "伴奏活动比例", "人声伴奏分贝差", "是否满足要求", "备注（如有）",
+    "人声活动比例", "伴奏活动比例", "人声伴奏分贝差", "峰值电平", "是否削波",
+    "是否满足要求", "备注（如有）",
 ];
+// "是否满足要求"/"备注" 永远是最后两列, 用相对位置算下标 —— 以后再插新列
+// 不用满仓库找哪里写死了 10/11, 那正是这次踩过的坑。
+pub const VERDICT_COL: usize = COLUMNS.len() - 2;
+pub const NOTES_COL: usize = COLUMNS.len() - 1;
 
 // ---- 判定阈值 (需要标定时改这里) --------------------------------------------
 pub const INS_ACTIVITY: f64 = 0.80;      // 伴奏活动比例 >=
@@ -24,6 +29,10 @@ pub const CUTOFF_HZ: f64 = 15000.0;      // 截止频率 >=
 pub const BITRATE_KBPS: f64 = 320.0;     // 码率 >=
 pub const NOISE_DBFS: f64 = -40.0;       // 底噪 <
 pub const RT60_S: f64 = 0.30;            // RT60 <
+pub const PEAK_DB_LO: f64 = -3.0;        // 动态范围控制: 峰值电平下限
+pub const PEAK_DB_HI: f64 = -1.0;        // 上限
+const CLIP_THRESHOLD: f64 = 0.999;       // 触顶判定, 留一点余量给量化噪声/有损编码重建误差
+const CLIP_MIN_RUN: usize = 3;           // 连续触顶达到这个采样数才算削波; 1~2个可能只是自然的峰值瞬间
 
 // ---- 分析参数 ---------------------------------------------------------------
 const WIN: f64 = 0.020;                  // 包络分析窗 (秒)
@@ -55,6 +64,12 @@ pub struct Decoded {
     pub mono: Vec<f64>,
     pub sr: u32,
     pub channels: usize,
+    /// 原始采样的最大绝对值(下混增益归一之前)。峰值电平必须用这个, 不能用
+    /// `mono` —— mono 为了对齐响度被乘过增益, 拿它算峰值会是缩放过的假峰值。
+    pub peak: f64,
+    /// 削波事件数: 某个声道连续 >=CLIP_MIN_RUN 个采样触顶算一次, 不是采样计数
+    /// (否则一段长削波会把数字撑得没有意义)。同理必须用原始采样, 不能用 mono。
+    pub clip_events: usize,
 }
 
 /// 解码成单声道 f64。下混按能量归一 —— 直接取平均的话, 左右不相关的立体声轨
@@ -96,9 +111,12 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
     let mut mono: Vec<f64> = Vec::new();
     let mut sum_sq_all = 0.0f64;      // 所有声道所有采样的平方和, 用于能量归一
     let mut n_all = 0usize;
+    let mut peak = 0.0f64;             // 原始采样最大绝对值, 增益归一之前记录
     let mut sr = params.sample_rate.unwrap_or(0);
     let mut channels = params.channels.as_ref().map(|c| c.count()).unwrap_or(1);
     let mut inter: Vec<f32> = Vec::new();
+    let mut clip_run: Vec<usize> = Vec::new();   // 每个声道各自的"当前连续触顶计数"
+    let mut clip_events = 0usize;
 
     loop {
         let packet = match format.next_packet() {
@@ -114,14 +132,21 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
                 let spec = buf.spec();
                 sr = spec.rate();
                 channels = spec.channels().count().max(1);
+                if clip_run.len() != channels {
+                    clip_run = vec![0usize; channels];   // 声道数变了(极少见)就重新起算
+                }
                 inter.clear();
                 buf.copy_to_vec_interleaved(&mut inter);
                 for fr in inter.chunks(channels) {
                     let mut s = 0.0f64;
-                    for &v in fr {
+                    for (ch, &v) in fr.iter().enumerate() {
                         let v = v as f64;
                         s += v;
                         sum_sq_all += v * v;
+                        peak = peak.max(v.abs());
+                        if clip_step(&mut clip_run[ch], v) {
+                            clip_events += 1;
+                        }
                     }
                     n_all += fr.len();
                     mono.push(s / fr.len() as f64);
@@ -148,7 +173,7 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
             }
         }
     }
-    Ok(Decoded { mono, sr, channels })
+    Ok(Decoded { mono, sr, channels, peak, clip_events })
 }
 
 // ============================================================ 指标
@@ -229,6 +254,28 @@ pub fn rms_db(x: &[f64]) -> f64 {
         return f64::NAN;
     }
     10.0 * (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + 1e-20).log10()
+}
+
+/// 峰值电平(dBFS) = 20*log10(最大绝对采样值)。真静音(peak=0)时没有意义, 返回 None。
+fn peak_dbfs(peak: f64) -> Option<f64> {
+    if peak > 0.0 { Some(20.0 * peak.log10()) } else { None }
+}
+
+/// 单声道的单个采样触顶检测: run 是调用方持有的"该声道当前连续触顶计数",
+/// 每来一个采样调用一次并原地更新; 连续触顶数刚好达到 CLIP_MIN_RUN 时返回
+/// true(新增一次削波事件), 之后同一段继续触顶不会重复计数。
+/// 只认"连续多个采样顶到满量程"这种硬削波; 孤立 1~2 个触顶采样可能只是
+/// 正常的瞬时峰值, 不算削波 —— 也正因为看的是"顶到满量程", 如果这段音频后来
+/// 被整体降过增益(削波后又标准化), 削平的痕迹会跟着降下去, 就测不出来了;
+/// 这是所有基于交付文件本身检测削波的工具共同的局限, 不是这里独有的。
+fn clip_step(run: &mut usize, sample: f64) -> bool {
+    if sample.abs() >= CLIP_THRESHOLD {
+        *run += 1;
+        *run == CLIP_MIN_RUN
+    } else {
+        *run = 0;
+        false
+    }
 }
 
 /// 长时平均谱 (dB), 只取有内容的帧, 最多 CUT_MAX_FRAMES 帧。
@@ -441,6 +488,8 @@ pub struct Track {
     pub noise: Option<f64>,
     pub cutoff: Option<f64>,
     pub rt60: Option<Rt60>,
+    pub peak_db: Option<f64>,
+    pub clip_events: usize,
 }
 
 pub fn analyse(path: &Path) -> Result<Track, String> {
@@ -466,6 +515,9 @@ pub fn analyse(path: &Path) -> Result<Track, String> {
         noise,
         cutoff: cutoff_hz(&d.mono, d.sr),
         rt60: rt60(&db, noise),
+        // 峰值电平/削波都必须用 d.peak/d.clip_events (原始采样, 增益归一之前), 不能用 d.mono
+        peak_db: peak_dbfs(d.peak),
+        clip_events: d.clip_events,
     })
 }
 
@@ -676,7 +728,7 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
                 let mut row = vec![String::new(); COLUMNS.len()];
                 row[0] = name;
                 row[1] = ext;
-                row[10] = format!("否：{e}");
+                row[VERDICT_COL] = format!("否：{e}");
                 rows.push(row);
                 continue;
             }
@@ -700,6 +752,19 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
             Some(nf) if nf >= NOISE_DBFS => fails.push(format!("底噪{nf:.1}dBFS高于-40")),
             Some(_) => {}
         }
+        match t.peak_db {
+            None => notes.push("峰值电平未测出".into()),
+            Some(pk) if !(PEAK_DB_LO..=PEAK_DB_HI).contains(&pk) => {
+                fails.push(format!("峰值电平{pk:.1}dBFS超出[-3,-1]"))
+            }
+            Some(_) => {}
+        }
+        // 削波是硬性禁止项, 跟峰值范围分开报: 峰值超标只是"响", 削波是"failed 已经失真"。
+        // 一个文件出现削波时峰值必然也贴着 0dBFS、峰值检查本来就会一起不合格,
+        // 这里单独给个明确原因, 免得被当成只是"没控制好响度"这种轻微问题。
+        if t.clip_events > 0 {
+            fails.push(format!("检测到削波({}处连续触顶采样)", t.clip_events));
+        }
 
         rows.push(vec![
             name,
@@ -712,6 +777,8 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
             voc_act.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_default(),
             ins_act.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_default(),
             fmt_opt(diff, 1),
+            fmt_opt(t.peak_db, 1),
+            if t.clip_events > 0 { format!("是({}处)", t.clip_events) } else { "否".into() },
             if fails.is_empty() { "是".into() } else { format!("否：{}", fails.join("；")) },
             notes.join("；"),
         ]);
@@ -813,6 +880,40 @@ mod tests {
         assert!((r.median - 0.25).abs() < 0.05, "RT60 {}", r.median);
         // 同一个已知衰减, 各段之间不该差太多
         assert!(r.segments >= 3, "衰减段数 {}", r.segments);
+    }
+
+    #[test]
+    fn peak_level() {
+        // 0.5 幅度 -> -6.02 dBFS
+        let p = peak_dbfs(0.5).expect("应测得峰值电平");
+        assert!((p - (-6.0206)).abs() < 0.01, "峰值电平 {p}");
+        // 真静音测不出峰值, 不能硬报 -inf
+        assert!(peak_dbfs(0.0).is_none());
+        // 满幅 = 0 dBFS
+        assert!((peak_dbfs(1.0).unwrap() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clip_detection() {
+        let mut run = 0usize;
+        let mut events = 0usize;
+        // 触顶2次(不够3连续, 不算) / 触顶3连续(算1次) / 触顶4连续(还是只算1次, 不重复计数)
+        for v in [0.5, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0] {
+            if clip_step(&mut run, v) {
+                events += 1;
+            }
+        }
+        assert_eq!(events, 2, "应识别出两段独立削波(第2/3段各算1次)");
+
+        // 孤立触顶(哪怕全曲仅此一处)不该被当成削波
+        let mut run = 0usize;
+        let mut events = 0usize;
+        for v in [0.3, 1.0, 0.2, 1.0, 0.1] {
+            if clip_step(&mut run, v) {
+                events += 1;
+            }
+        }
+        assert_eq!(events, 0, "孤立触顶采样不算削波");
     }
 
     #[test]
