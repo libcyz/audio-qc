@@ -29,8 +29,8 @@ pub const CUTOFF_HZ: f64 = 15000.0;      // 截止频率 >=
 pub const BITRATE_KBPS: f64 = 320.0;     // 码率 >=
 pub const NOISE_DBFS: f64 = -40.0;       // 底噪 <
 pub const RT60_S: f64 = 0.30;            // RT60 <
-pub const PEAK_DB_LO: f64 = -3.0;        // 动态范围控制: 峰值电平下限
-pub const PEAK_DB_HI: f64 = -1.0;        // 上限
+pub const PEAK_DB_LO: f64 = -8.0;        // 动态范围控制: 峰值电平下限
+pub const PEAK_DB_HI: f64 = -3.0;        // 上限
 // 削波判定阈值。这里踩过一个坑, 记录一下取舍:
 //
 // 第一版按"贴不贴这个文件自己的峰值"(相对阈值)算, 想解决"削波发生在数字化之前
