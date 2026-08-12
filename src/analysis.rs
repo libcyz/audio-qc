@@ -767,7 +767,7 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
         match t.peak_db {
             None => notes.push("峰值电平未测出".into()),
             Some(pk) if !(PEAK_DB_LO..=PEAK_DB_HI).contains(&pk) => {
-                fails.push(format!("峰值电平{pk:.1}dBFS超出[-3,-1]"))
+                fails.push(format!("峰值电平{pk:.1}dBFS超出[-8,-3]"))
             }
             Some(_) => {}
         }
