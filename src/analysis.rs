@@ -565,7 +565,18 @@ pub fn analyse(path: &Path) -> Result<Track, String> {
     })
 }
 
-// ============================================================ 角色 / 分组
+// ============================================================ 角色识别(文件名后缀)
+//
+// 曾经改成用 YAMNet 判内容, 不看文件名——分类模型内嵌进 exe 后体积从 9.5MB
+// 涨到 45MB, "是不是人声"判得很准, 但"混音 vs 纯伴奏"这条线样本不够、置信度
+// 明显更低, 单独扔一个混音文件时还想按帧识别人声更是测出来不可靠(拿已知的
+// 人声轨活动比例当真值验证, 固定阈值召回率只有 0.34, 换算下来"人声活动比例"
+// 会被系统性低估)。改回文件名后缀匹配, 按下面这套已知的真实命名规则识别:
+//   人声清唱 xxx_voc                => Role::Voc
+//   人声弹唱 xxx_vocselfacc         => Role::Voc(带自弹伴奏, 仍是人声表演本身)
+//   伴奏     xxx_inst               => Role::Ins
+//   清唱+伴奏合轨 xxx_vocandinst        => Role::Mix
+//   弹唱+伴奏合轨 xxx_vocselfaccandinst => Role::Mix
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Mix,
@@ -573,11 +584,24 @@ pub enum Role {
     Ins,
 }
 
-// 角色后缀按长到短排, 免得 "vocals" 被 "voc" 先吃掉
-const VOC_SUFFIX: [&str; 4] = ["vocals", "vocal", "voc", "人声"];
-const INS_SUFFIX: [&str; 4] = ["instrumental", "ins", "acc", "伴奏"];
+// 复合后缀必须排在被它包含的短后缀前面检查, 不然 "vocandinst" 会先被 "voc"
+// 吃掉, "vocselfaccandinst" 会先被 "vocselfacc" 吃掉。
+const SUFFIX_PATTERNS: &[(&str, Role)] = &[
+    ("vocselfaccandinst", Role::Mix), // 人声弹唱+伴奏合轨
+    ("vocandinst", Role::Mix),        // 人声清唱+伴奏合轨
+    ("vocselfacc", Role::Voc),        // 人声弹唱(带自弹伴奏, 仍算人声轨参考)
+    ("vocals", Role::Voc),
+    ("vocal", Role::Voc),
+    ("voc", Role::Voc),               // 人声清唱
+    ("人声", Role::Voc),
+    ("instrumental", Role::Ins),
+    ("inst", Role::Ins),              // 伴奏
+    ("ins", Role::Ins),                // 伴奏的另一种缩写(与 inst 不冲突: "..inst"结尾不会被"ins"提前吃掉)
+    ("acc", Role::Ins),
+    ("伴奏", Role::Ins),
+];
 const VOC_BRACKET: [&str; 3] = ["vocal", "vocals", "人声"];
-const INS_BRACKET: [&str; 4] = ["instrumental", "inst", "off vocal", "伴奏"];
+const INS_BRACKET: [&str; 5] = ["instrumental", "inst", "ins", "off vocal", "伴奏"];
 
 fn strip_bracket(stem: &str, tokens: &[&str]) -> Option<String> {
     let low = stem.to_ascii_lowercase();   // 只降 ASCII, 保证字节偏移与原串一致
@@ -596,20 +620,19 @@ fn strip_bracket(stem: &str, tokens: &[&str]) -> Option<String> {
 
 /// 把文件名拆成 (歌名, 角色)。
 ///
-/// 角色只认结尾后缀(-Voc / _Ins / -人声)或带括号的标记((Instrumental))。
-/// 不能用"名字里含 ins"来判 —— 一整个文件夹的 xxx_(Instrumental)(1).mp3 会被
-/// 全判成同一首歌的伴奏轨, 只剩一条; 而 Insane / Wins 这种词也会被误伤。
+/// 角色只认结尾后缀(-Voc / _Ins / -人声 / _vocandinst 等)或带括号的标记
+/// ((Instrumental))。不能用"名字里含 ins"来判 —— 一整个文件夹的
+/// xxx_(Instrumental)(1).mp3 会被全判成同一首歌的伴奏轨, 只剩一条; 而
+/// Insane / Wins 这种词也会被误伤。
 pub fn split_role(stem: &str) -> (String, Role) {
     let low = stem.to_ascii_lowercase();
-    for (tokens, role) in [(&VOC_SUFFIX[..], Role::Voc), (&INS_SUFFIX[..], Role::Ins)] {
-        for t in tokens {
-            if low.ends_with(t) {
-                let base = &stem[..stem.len() - t.len()];
-                let trimmed = base.trim_end_matches([' ', '_', '-']);
-                // 拉丁词要求前面有分隔符(避免 Wins 结尾被当成 ins); 中文标记不要求
-                if !t.is_ascii() || trimmed.len() < base.len() {
-                    return (trimmed.to_string(), role);
-                }
+    for &(t, role) in SUFFIX_PATTERNS {
+        if low.ends_with(t) {
+            let base = &stem[..stem.len() - t.len()];
+            let trimmed = base.trim_end_matches([' ', '_', '-']);
+            // 拉丁词要求前面有分隔符(避免 Wins 结尾被当成 ins); 中文标记不要求
+            if !t.is_ascii() || trimmed.len() < base.len() {
+                return (trimmed.to_string(), role);
             }
         }
     }
@@ -633,35 +656,27 @@ pub struct SongGroup {
 pub fn group_audio(files: &[PathBuf]) -> Vec<SongGroup> {
     let mut order: Vec<String> = Vec::new();
     let mut songs: std::collections::HashMap<String, Vec<(PathBuf, Role)>> = Default::default();
-    let mut extras: Vec<(PathBuf, Role)> = Vec::new();
 
     for p in files {
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let (base, role) = split_role(stem);
-        let slot = songs.entry(base.clone()).or_insert_with(|| {
+        // 同一首歌可以合法出现两个 Voc 角色(voc + vocselfacc)和两个 Mix 角色
+        // (vocandinst + vocselfaccandinst), 所以按角色去重会误拆; 直接都收进同
+        // 一组, check_song 里每个文件各出各的一行, 互不覆盖。
+        songs.entry(base.clone()).or_insert_with(|| {
             order.push(base.clone());
             Vec::new()
-        });
-        if slot.iter().any(|(_, r)| *r == role) {
-            extras.push((p.clone(), role));   // 同名同角色撞车, 单独成组, 保证每个文件都出结果
-        } else {
-            slot.push((p.clone(), role));
-        }
+        }).push((p.clone(), role));
     }
 
-    let mut out: Vec<SongGroup> = order
+    order
         .into_iter()
         .map(|t| {
             let mut files = songs.remove(&t).unwrap_or_default();
             files.sort_by(|a, b| a.0.cmp(&b.0));
             SongGroup { title: t, files }
         })
-        .collect();
-    for (p, r) in extras {
-        let title = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        out.push(SongGroup { title, files: vec![(p, r)] });
-    }
-    out
+        .collect()
 }
 
 // ============================================================ 判定 / 出行
@@ -1020,5 +1035,46 @@ mod tests {
         let g = group_audio(&files);
         assert_eq!(g.len(), 10, "散装伴奏应各成一组");
         assert!(g.iter().all(|s| s.files.len() == 1));
+    }
+
+    #[test]
+    fn real_naming_scheme() {
+        // 交付方真实命名规则: {语种}_{风格}_{录音人ID}_{歌曲ID}_{文件类型}
+        assert_eq!(
+            split_role("ZH_T1_S000001_G000001_voc"),
+            ("ZH_T1_S000001_G000001".into(), Role::Voc)
+        );
+        assert_eq!(
+            split_role("ZH_T1_S000001_G000001_vocselfacc"),
+            ("ZH_T1_S000001_G000001".into(), Role::Voc)
+        );
+        assert_eq!(
+            split_role("ZH_T1_S000001_G000001_inst"),
+            ("ZH_T1_S000001_G000001".into(), Role::Ins)
+        );
+        assert_eq!(
+            split_role("ZH_T1_S000001_G000001_vocandinst"),
+            ("ZH_T1_S000001_G000001".into(), Role::Mix)
+        );
+        assert_eq!(
+            split_role("ZH_T1_S000001_G000001_vocselfaccandinst"),
+            ("ZH_T1_S000001_G000001".into(), Role::Mix)
+        );
+
+        // 全部 5 个文件同名同基座, 应分到同一组(vocandinst/vocselfaccandinst
+        // 与 voc/vocselfacc 都判 base 不同角色, 不会互相当"同名同角色"顶掉)
+        let files: Vec<PathBuf> = [
+            "ZH_T1_S000001_G000001_voc.wav",
+            "ZH_T1_S000001_G000001_vocselfacc.wav",
+            "ZH_T1_S000001_G000001_inst.wav",
+            "ZH_T1_S000001_G000001_vocandinst.wav",
+            "ZH_T1_S000001_G000001_vocselfaccandinst.wav",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let g = group_audio(&files);
+        assert_eq!(g.len(), 1, "5个同曲文件应分到同一组");
+        assert_eq!(g[0].files.len(), 5);
     }
 }
