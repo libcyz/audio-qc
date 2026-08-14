@@ -96,6 +96,7 @@ struct App {
     rx: Option<Receiver<Msg>>,
     cancel: Option<Arc<AtomicBool>>,
     toast: String,
+    cfg: analysis::Settings,
 }
 
 impl App {
@@ -148,7 +149,8 @@ impl App {
         } else {
             None
         };
-        std::thread::spawn(move || worker(jobs, root, out, tx, cancel));
+        let cfg = self.cfg;
+        std::thread::spawn(move || worker(jobs, root, out, tx, cancel, cfg));
     }
 }
 
@@ -158,6 +160,7 @@ fn worker(
     out: PathBuf,
     tx: Sender<Msg>,
     cancel: Arc<AtomicBool>,
+    cfg: analysis::Settings,
 ) {
     let total = jobs.len();
     let mut all: Vec<Vec<String>> = Vec::new();
@@ -168,7 +171,7 @@ fn worker(
             break;
         }
         let _ = tx.send(Msg::Status(format!("({}/{}) {}", i + 1, total, g.title)));
-        let rows = check_song(g, root.as_deref());
+        let rows = check_song(g, root.as_deref(), &cfg);
         if rows.iter().any(|r| r[analysis::VERDICT_COL] != "是") {
             bad_songs += 1;
         }
@@ -461,6 +464,55 @@ impl eframe::App for App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(egui::RichText::new(&self.status).weak());
+                });
+            });
+
+            // 平均幅值的两个可调项。校验途中不让改, 免得同一批结果用了两套参数。
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    ui.label("平均幅值 活动段判据");
+                    let cur = match self.cfg.avg_mode {
+                        analysis::AvgMode::Energy => "能量阈值",
+                        analysis::AvgMode::Vad(0) => "VAD 0 (最宽松)",
+                        analysis::AvgMode::Vad(1) => "VAD 1",
+                        analysis::AvgMode::Vad(2) => "VAD 2",
+                        _ => "VAD 3 (最严)",
+                    };
+                    egui::ComboBox::from_id_salt("avg_mode")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            use analysis::AvgMode::*;
+                            ui.selectable_value(&mut self.cfg.avg_mode, Vad(0), "VAD 0 (最宽松)");
+                            ui.selectable_value(&mut self.cfg.avg_mode, Vad(1), "VAD 1");
+                            ui.selectable_value(&mut self.cfg.avg_mode, Vad(2), "VAD 2");
+                            ui.selectable_value(&mut self.cfg.avg_mode, Vad(3), "VAD 3 (最严)");
+                            ui.selectable_value(&mut self.cfg.avg_mode, Energy, "能量阈值");
+                        })
+                        .response
+                        .on_hover_text(
+                            "WebRTC VAD 按人声特征挑活动段, 数字越大判得越严。\n\
+                             纯伴奏轨 VAD 认不出人声时会自动退回能量阈值。",
+                        );
+
+                    ui.add_space(12.0);
+                    ui.label("合格范围");
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.avg_db_lo)
+                            .speed(0.5)
+                            .range(-60.0..=0.0)
+                            .suffix(" dBFS"),
+                    );
+                    ui.label("～");
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.avg_db_hi)
+                            .speed(0.5)
+                            .range(-60.0..=0.0)
+                            .suffix(" dBFS"),
+                    );
+                    if ui.button("恢复默认").clicked() {
+                        self.cfg = analysis::Settings::default();
+                    }
                 });
             });
 

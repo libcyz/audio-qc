@@ -30,8 +30,41 @@ pub const BITRATE_KBPS: f64 = 320.0;     // 码率 >=
 pub const NOISE_DBFS: f64 = -40.0;       // 底噪 <
 pub const RT60_S: f64 = 0.30;            // RT60 <
 pub const PEAK_DB_MAX: f64 = -1.0;       // 峰值电平: 不超过这个值(没有下限)
-pub const AVG_DB_LO: f64 = -8.0;         // 平均幅值(活动段 RMS): 下限
-pub const AVG_DB_HI: f64 = -3.0;         // 上限
+pub const AVG_DB_LO: f64 = -26.0;        // 平均幅值(活动段 RMS): 下限, 界面可改
+pub const AVG_DB_HI: f64 = -3.0;         // 上限, 界面可改
+
+// ---- 界面可调参数 -----------------------------------------------------------
+/// 平均幅值统计"活动段"的方式。活动比例和底噪不受这个开关影响 —— 那两项按
+/// "活动时长/整歌时长"定义, 一直用能量阈值算, 换成语音检测反而会漏掉伴奏。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AvgMode {
+    /// 能量阈值: 高于本轨 P95 电平 -35dB。项目里一直在用的那套。
+    Energy,
+    /// WebRTC VAD, 0~3 是激进程度(越大越严, 判成人声的帧越少)。
+    /// 注意它本来是给语音设计的, 对纯伴奏轨会大面积判成"无人声",
+    /// 这种情况下自动退回能量阈值, 免得平均幅值算不出来。
+    Vad(u8),
+}
+
+/// 界面上能改的参数。其余阈值仍写死成常量 —— 只把真正需要现场标定的放出来。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Settings {
+    pub avg_mode: AvgMode,
+    pub avg_db_lo: f64,
+    pub avg_db_hi: f64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { avg_mode: AvgMode::Vad(1), avg_db_lo: AVG_DB_LO, avg_db_hi: AVG_DB_HI }
+    }
+}
+
+const VAD_SR: u32 = 16000;               // WebRTC VAD 只收 8k/16k/32k/48k
+const VAD_WIN: f64 = 0.020;              // 只支持 10/20/30ms; 20ms 正好是两个 HOP
+/// VAD 判出的活动帧少于这个比例就认为它"没看懂这条轨"(典型是纯伴奏轨),
+/// 退回能量阈值。不然平均幅值会拿极少数几帧算, 数字没有意义。
+const VAD_MIN_ACTIVE: f64 = 0.05;
 // 削波判定阈值。这里踩过一个坑, 记录一下取舍:
 //
 // 第一版按"贴不贴这个文件自己的峰值"(相对阈值)算, 想解决"削波发生在数字化之前
@@ -278,16 +311,15 @@ pub fn rms_db(x: &[f64]) -> f64 {
 /// db 是调用方已经算好的逐帧包络(frame_db 的结果), 这里复用, 不重复算一遍;
 /// 每个活跃帧只计入 HOP 那部分采样(不是整个 WIN 窗口), 跟 active_seconds 数
 /// 时长的口径保持一致 —— 帧与帧之间有重叠, 按 WIN 算会把重叠区间重复计数。
-fn active_rms_db(x: &[f64], sr: u32, db: &[f64]) -> f64 {
-    if db.is_empty() {
+fn active_rms_db(x: &[f64], sr: u32, mask: &[bool]) -> f64 {
+    if mask.is_empty() {
         return rms_db(x);   // 太短测不出包络, 退回整段算
     }
-    let thr = active_threshold(db);
     let hop = (sr as f64 * HOP) as usize;
     let mut sum_sq = 0.0f64;
     let mut n = 0usize;
-    for (k, &d) in db.iter().enumerate() {
-        if d <= thr {
+    for (k, &active) in mask.iter().enumerate() {
+        if !active {
             continue;
         }
         let s = k * hop;
@@ -299,6 +331,61 @@ fn active_rms_db(x: &[f64], sr: u32, db: &[f64]) -> f64 {
         return rms_db(x);   // 极端情况全曲没有一帧判定为活跃, 保险退回整段算
     }
     10.0 * (sum_sq / n as f64 + 1e-20).log10()
+}
+
+/// 能量阈值活动掩码, 与 active_seconds / noise_floor_db 同一套判据。
+fn energy_mask(db: &[f64]) -> Vec<bool> {
+    let thr = active_threshold(db);
+    db.iter().map(|&v| v > thr).collect()
+}
+
+/// WebRTC VAD 活动掩码, 长度对齐到 db 的帧数(10ms 一格)。
+///
+/// VAD 只吃 16bit PCM、固定采样率、10/20/30ms 定长帧, 所以先线性重采样到 16k
+/// 再按 20ms 切。一个 VAD 帧刚好盖住两个 HOP, 直接 k/2 映射回去。
+/// 判成人声的帧太少(纯伴奏轨的典型表现)时返回 None, 由调用方退回能量阈值。
+fn vad_mask(x: &[f64], sr: u32, mode: u8, frames: usize) -> Option<Vec<bool>> {
+    use webrtc_vad::{SampleRate, Vad, VadMode};
+
+    let n = (x.len() as f64 * VAD_SR as f64 / sr as f64) as usize;
+    let step = (VAD_SR as f64 * VAD_WIN) as usize;
+    if n < step {
+        return None;
+    }
+    // 线性重采样并转 i16。VAD 只看频谱形状, 这点插值误差无所谓。
+    let pcm: Vec<i16> = (0..n)
+        .map(|i| {
+            let t = i as f64 * sr as f64 / VAD_SR as f64;
+            let a = t.floor() as usize;
+            let v = if a + 1 < x.len() {
+                x[a] + (x[a + 1] - x[a]) * (t - a as f64)
+            } else {
+                x[x.len() - 1]
+            };
+            (v.clamp(-1.0, 1.0) * i16::MAX as f64) as i16
+        })
+        .collect();
+
+    let m = match mode {
+        0 => VadMode::Quality,
+        1 => VadMode::LowBitrate,
+        2 => VadMode::Aggressive,
+        _ => VadMode::VeryAggressive,
+    };
+    let mut vad = Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, m);
+    let voiced: Vec<bool> = pcm
+        .chunks_exact(step)
+        .map(|c| vad.is_voice_segment(c).unwrap_or(false))
+        .collect();
+    if voiced.is_empty() {
+        return None;
+    }
+
+    let mask: Vec<bool> = (0..frames)
+        .map(|k| *voiced.get(k / 2).unwrap_or(&false))
+        .collect();
+    let ratio = mask.iter().filter(|v| **v).count() as f64 / mask.len().max(1) as f64;
+    (ratio >= VAD_MIN_ACTIVE).then_some(mask)
 }
 
 /// 峰值电平(dBFS) = 20*log10(最大绝对采样值)。真静音(peak=0)时没有意义, 返回 None。
@@ -536,7 +623,7 @@ pub struct Track {
     pub clip_events: usize,
 }
 
-pub fn analyse(path: &Path) -> Result<Track, String> {
+pub fn analyse(path: &Path, cfg: &Settings) -> Result<Track, String> {
     let size = std::fs::metadata(path).map_err(|e| format!("读不到文件信息({e})"))?.len();
     if size == 0 {
         return Err("文件是空的(0 字节)".into());
@@ -548,6 +635,12 @@ pub fn analyse(path: &Path) -> Result<Track, String> {
     }
     let db = frame_db(&d.mono, d.sr);
     let noise = noise_floor_db(&db);
+    // 平均幅值的活动段判据可切换; 活动比例/底噪始终走能量阈值(定义如此)
+    let mask = match cfg.avg_mode {
+        AvgMode::Vad(m) => vad_mask(&d.mono, d.sr, m, db.len()),
+        AvgMode::Energy => None,
+    }
+    .unwrap_or_else(|| energy_mask(&db));
     Ok(Track {
         path: path.to_path_buf(),
         sr: d.sr,
@@ -555,7 +648,7 @@ pub fn analyse(path: &Path) -> Result<Track, String> {
         // 码率用 文件字节数/时长 实测: 对 wav 和 mp3 都成立, 且 VBR 拿到的是真实均值
         bitrate: size as f64 * 8.0 / dur / 1000.0,
         active_s: active_seconds(&db),
-        rms: active_rms_db(&d.mono, d.sr, &db),
+        rms: active_rms_db(&d.mono, d.sr, &mask),
         noise,
         cutoff: cutoff_hz(&d.mono, d.sr),
         rt60: rt60(&db, noise),
@@ -579,7 +672,9 @@ pub fn analyse(path: &Path) -> Result<Track, String> {
 //   弹唱+伴奏合轨 xxx_vocselfaccandinst => Role::Mix
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
+    /// 合轨: 只有 *andinst 结尾的才是, 人声和伴奏已经混在一条轨里
     Mix,
+    /// 人声轨(清唱 voc / 弹唱 vocselfacc): 都是独立人声轨, 不含伴奏
     Voc,
     Ins,
 }
@@ -589,7 +684,7 @@ pub enum Role {
 const SUFFIX_PATTERNS: &[(&str, Role)] = &[
     ("vocselfaccandinst", Role::Mix), // 人声弹唱+伴奏合轨
     ("vocandinst", Role::Mix),        // 人声清唱+伴奏合轨
-    ("vocselfacc", Role::Voc),        // 人声弹唱(带自弹伴奏, 仍算人声轨参考)
+    ("vocselfacc", Role::Voc),        // 人声弹唱(独立人声轨, 不是合轨)
     ("vocals", Role::Voc),
     ("vocal", Role::Voc),
     ("voc", Role::Voc),               // 人声清唱
@@ -693,6 +788,14 @@ fn mmss(s: f64) -> String {
     format!("{:02}:{:02}", t / 60, t % 60)
 }
 
+/// 活动比例那两列: 有数字就写百分比, 没有就按角色写明原因(见 activity_placeholder)
+fn fmt_act(v: Option<f64>, role: Role, voc_col: bool) -> String {
+    match v {
+        Some(v) => format!("{:.1}%", v * 100.0),
+        None => activity_placeholder(role, voc_col).to_string(),
+    }
+}
+
 /// 把一个文件自己的活动比例放进 (人声活动比例, 伴奏活动比例) 里, 另一列留空。
 ///
 /// 合轨(Mix)算伴奏那一列: 伴奏是整首连续演奏的, 所以"合轨整体有声的时间"约等于
@@ -706,11 +809,21 @@ fn split_activity(role: Role, act: Option<f64>) -> (Option<f64>, Option<f64>) {
     }
 }
 
+/// 那一列没有数字时显示什么。文件里压根没有这个声源就写明"无人声"/"无伴奏";
+/// 合轨是两个声源都有、只是分不出来, 那就留空 —— 写"无人声"会是假话。
+fn activity_placeholder(role: Role, voc_col: bool) -> &'static str {
+    match (role, voc_col) {
+        (Role::Ins, true) => "无人声",
+        (Role::Voc, false) => "无伴奏",
+        _ => "",
+    }
+}
+
 /// 校验一首歌, 每个音频出一行。root 用于把文件名显示成相对路径。
-pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
+pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec<Vec<String>> {
     let mut tracks: Vec<(Role, Result<Track, String>)> = Vec::new();
     for (p, role) in &group.files {
-        tracks.push((*role, analyse(p)));
+        tracks.push((*role, analyse(p, cfg)));
     }
 
     let get = |want: Role| -> Option<&Track> {
@@ -841,8 +954,11 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
         }
         // 平均幅值 = 活动段 RMS(t.rms), 跟峰值电平是两回事: 峰值管"顶没顶到头",
         // 平均幅值管"整体响不响"——同一个峰值下, 平均幅值越高说明动态压得越死。
-        if !(AVG_DB_LO..=AVG_DB_HI).contains(&t.rms) {
-            fails.push(format!("平均幅值{:.1}dBFS超出[{AVG_DB_LO},{AVG_DB_HI}]", t.rms));
+        if !(cfg.avg_db_lo..=cfg.avg_db_hi).contains(&t.rms) {
+            fails.push(format!(
+                "平均幅值{:.1}dBFS超出[{},{}]",
+                t.rms, cfg.avg_db_lo, cfg.avg_db_hi
+            ));
         }
         // 削波是硬性禁止项, 跟峰值范围分开报: 峰值超标只是"响", 削波是"failed 已经失真"。
         // 一个文件出现削波时峰值必然也贴着 0dBFS、峰值检查本来就会一起不合格,
@@ -859,8 +975,8 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
             format!("{:.0}", t.bitrate),
             fmt_opt(t.noise, 1),
             fmt_opt(t.cutoff.map(|c| c / 1000.0), 2),
-            voc_act.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_default(),
-            ins_act.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_default(),
+            fmt_act(voc_act, *role, true),
+            fmt_act(ins_act, *role, false),
             fmt_opt(diff, 1),
             fmt_opt(t.peak_db, 1),
             format!("{:.1}", t.rms),
@@ -912,7 +1028,7 @@ mod tests {
         x.extend(noise(5 * sr as usize, 1e-4, 42));
         let db = frame_db(&x, sr);
         let whole = rms_db(&x);
-        let active = active_rms_db(&x, sr, &db);
+        let active = active_rms_db(&x, sr, &energy_mask(&db));
         let sine_only = rms_db(&sine(sr, 5.0, 440.0, 0.5));
         assert!(
             (active - sine_only).abs() < 1.0,
@@ -1064,12 +1180,32 @@ mod tests {
     }
 
     #[test]
+    fn vad_mask_falls_back_when_it_finds_nothing() {
+        // VAD 一帧都判不出人声时必须返回 None, 让调用方退回能量阈值 ——
+        // 不然平均幅值会拿零星几帧去算, 数字没有意义
+        let sr = 48000;
+        let quiet = vec![0.0f64; 3 * sr as usize];
+        let frames = frame_db(&quiet, sr).len();
+        assert!(vad_mask(&quiet, sr, 3, frames).is_none());
+
+        // 太短(不足一个 VAD 帧)也要返回 None, 不能 panic
+        assert!(vad_mask(&[0.1; 100], sr, 1, 1).is_none());
+    }
+
+    #[test]
     fn activity_goes_to_own_column() {
         // 每个文件只填自己测得出来的那一列, 另一列必须留空
         assert_eq!(split_activity(Role::Voc, Some(0.69)), (Some(0.69), None));
         assert_eq!(split_activity(Role::Ins, Some(0.98)), (None, Some(0.98)));
         // 合轨: 整体活动当伴奏活动, 人声那列留空(分不出来)
         assert_eq!(split_activity(Role::Mix, Some(0.99)), (None, Some(0.99)));
+
+        // 空着的那列要写明原因, 而不是留白
+        assert_eq!(fmt_act(None, Role::Voc, false), "无伴奏");
+        assert_eq!(fmt_act(None, Role::Ins, true), "无人声");
+        // 合轨两个声源都有, 只是分不出来 —— 不能写"无人声"
+        assert_eq!(fmt_act(None, Role::Mix, true), "");
+        assert_eq!(fmt_act(Some(0.692), Role::Voc, true), "69.2%");
     }
 
     #[test]
