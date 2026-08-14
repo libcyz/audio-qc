@@ -593,6 +593,7 @@ const SUFFIX_PATTERNS: &[(&str, Role)] = &[
     ("vocals", Role::Voc),
     ("vocal", Role::Voc),
     ("voc", Role::Voc),               // 人声清唱
+    ("vol", Role::Voc),                // 实际交付里出现过的手滑拼法(voc 误打成 vol)
     ("人声", Role::Voc),
     ("instrumental", Role::Ins),
     ("inst", Role::Ins),              // 伴奏
@@ -692,6 +693,19 @@ fn mmss(s: f64) -> String {
     format!("{:02}:{:02}", t / 60, t % 60)
 }
 
+/// 把一个文件自己的活动比例放进 (人声活动比例, 伴奏活动比例) 里, 另一列留空。
+///
+/// 合轨(Mix)算伴奏那一列: 伴奏是整首连续演奏的, 所以"合轨整体有声的时间"约等于
+/// "伴奏在响的时间", 拿来卡 >=80% 是有意义的。反过来"人声什么时候在唱"就不行了,
+/// 那要把混在一起的两个声源分开才知道 —— 实测音源分离模型在这件事上会系统性高估
+/// (残留的伴奏泄漏被当成人声活动), 足以让判定结果翻面, 所以这一列宁可留空。
+fn split_activity(role: Role, act: Option<f64>) -> (Option<f64>, Option<f64>) {
+    match role {
+        Role::Voc => (act, None),
+        Role::Ins | Role::Mix => (None, act),
+    }
+}
+
 /// 校验一首歌, 每个音频出一行。root 用于把文件名显示成相对路径。
 pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
     let mut tracks: Vec<(Role, Result<Track, String>)> = Vec::new();
@@ -715,8 +729,8 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
         .map(|t| t.dur)
         .fold(0.0f64, f64::max);
 
-    let voc_act = voc.filter(|_| dur > 0.0).map(|t| t.active_s / dur);
-    let ins_act = ins.filter(|_| dur > 0.0).map(|t| t.active_s / dur);
+    // 分贝差必须两条轨相减, 是唯一跨文件的指标; 活动比例改成每个文件各算各的
+    // (见下面 split_activity), 不再整组共用。
     let diff = match (voc, ins) {
         (Some(v), Some(i)) => Some(v.rms - i.rms),
         _ => None,
@@ -727,16 +741,6 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
     // 整首歌共用的判定, 会写进这首歌的每一行
     let mut song_fails: Vec<String> = Vec::new();
     let mut song_notes: Vec<String> = Vec::new();
-    if let Some(v) = ins_act {
-        if v < INS_ACTIVITY {
-            song_fails.push(format!("伴奏活动比例{:.1}%<80%", v * 100.0));
-        }
-    }
-    if let Some(v) = voc_act {
-        if v < VOC_ACTIVITY {
-            song_fails.push(format!("人声活动比例{:.1}%<40%", v * 100.0));
-        }
-    }
     if let Some(v) = diff {
         if !(RMS_DIFF_LO..=RMS_DIFF_HI).contains(&v) {
             song_fails.push(format!("人声伴奏分贝差{v:+.1}dB超出[-15,10]"));
@@ -770,7 +774,7 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
     }
 
     let mut rows = Vec::new();
-    for ((_, res), (path, _)) in tracks.iter().zip(&group.files) {
+    for ((role, res), (path, _)) in tracks.iter().zip(&group.files) {
         let name = match root {
             Some(r) => path.strip_prefix(r).unwrap_or(path).to_string_lossy().to_string(),
             None => path.file_name().unwrap_or_default().to_string_lossy().to_string(),
@@ -796,6 +800,23 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>) -> Vec<Vec<String>> {
 
         let mut fails = song_fails.clone();
         let mut notes = song_notes.clone();
+
+        // 活动比例是"这个文件自己的活动时长 / 整歌时长", 每个文件只填自己那一列
+        let act = if dur > 0.0 { Some(t.active_s / dur) } else { None };
+        let (voc_act, ins_act) = split_activity(*role, act);
+        if *role == Role::Mix && ins_act.is_some() {
+            notes.push("伴奏活动比例按合轨整体活动计".into());
+        }
+        if let Some(v) = ins_act {
+            if v < INS_ACTIVITY {
+                fails.push(format!("伴奏活动比例{:.1}%<80%", v * 100.0));
+            }
+        }
+        if let Some(v) = voc_act {
+            if v < VOC_ACTIVITY {
+                fails.push(format!("人声活动比例{:.1}%<40%", v * 100.0));
+            }
+        }
         if t.bitrate < BITRATE_KBPS {
             fails.push(format!("码率{:.0}kbps<320", t.bitrate));
         }
@@ -1018,6 +1039,11 @@ mod tests {
         assert_eq!(split_role("下雨天_伴奏"), ("下雨天".into(), Role::Ins));
         assert_eq!(split_role("x_(Instrumental)(1)").1, Role::Ins);
         assert_eq!(split_role("Insane Wins").1, Role::Mix);   // 普通词里的 ins 不算
+        // 实际交付里出现过的手滑拼法: voc 误打成 vol
+        assert_eq!(
+            split_role("ZH_T1_S000001_G000233_vol"),
+            ("ZH_T1_S000001_G000233".into(), Role::Voc)
+        );
 
         // 一首歌的三条轨合成一组
         let files: Vec<PathBuf> = ["下雨天.wav", "下雨天-Voc.wav", "下雨天-Ins.wav"]
@@ -1035,6 +1061,15 @@ mod tests {
         let g = group_audio(&files);
         assert_eq!(g.len(), 10, "散装伴奏应各成一组");
         assert!(g.iter().all(|s| s.files.len() == 1));
+    }
+
+    #[test]
+    fn activity_goes_to_own_column() {
+        // 每个文件只填自己测得出来的那一列, 另一列必须留空
+        assert_eq!(split_activity(Role::Voc, Some(0.69)), (Some(0.69), None));
+        assert_eq!(split_activity(Role::Ins, Some(0.98)), (None, Some(0.98)));
+        // 合轨: 整体活动当伴奏活动, 人声那列留空(分不出来)
+        assert_eq!(split_activity(Role::Mix, Some(0.99)), (None, Some(0.99)));
     }
 
     #[test]
