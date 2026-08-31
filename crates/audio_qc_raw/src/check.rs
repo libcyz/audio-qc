@@ -98,7 +98,6 @@ pub struct Raw {
     pub cutoff: Option<f64>,
     /// 低频端: 内容真正延伸到的最低 1/3 倍频程中心频率。
     pub low_edge: Option<f64>,
-    pub flatness: Option<f64>,
     /// 20~40Hz 相对 100~300Hz 的落差 dB, 正数表示低频更弱。
     pub low_rolloff: Option<f64>,
     pub clip_events: usize,
@@ -146,7 +145,6 @@ pub fn analyse(path: &Path, _cfg: &Settings) -> Result<Raw, String> {
     let peak_db = (d.peak > 0.0).then(|| 20.0 * d.peak.log10());
     let cutoff = cutoff_hz(&d.mono, d.sr);
     let spec = ltas_db(&d.mono);
-    let flatness = spec.as_ref().and_then(|s| flatness_db(s, d.sr));
     let low_rolloff = spec.as_ref().and_then(|s| low_rolloff_db(s, d.sr));
     let low_edge = spec.as_ref().and_then(|s| low_edge_hz(s, d.sr));
 
@@ -165,7 +163,6 @@ pub fn analyse(path: &Path, _cfg: &Settings) -> Result<Raw, String> {
         peak_db,
         cutoff,
         low_edge,
-        flatness,
         low_rolloff,
         clip_events: d.clip_events,
         zero_s: interior_zero_seconds(&db),
@@ -210,6 +207,11 @@ fn third_octave(spec: &[f64], sr: u32) -> Vec<(f64, f64)> {
 }
 
 /// 频响起伏 = 各 1/3 倍频程带级的 P95-P5 跨度。
+///
+/// **暂时没有接进结果表。** 拿正常素材算出来的是内容本身的频谱起伏, 交付方看了
+/// 也没法据此做任何决定, 放在备注里只是噪音(这一列就是被这种东西挤垮过一次)。
+/// 函数留着: 等交付方开始每批附扫频/粉噪校准文件, ±3dB 就靠它算。
+#[allow(dead_code)]
 ///
 /// 注意: 拿正常人声/音乐算出来的是**素材本身**的频谱起伏, 不是录音链路的频响。
 /// 只有素材是扫频/粉噪这类已知激励时, 这个数才等于"频响 ±xx dB"。见"局限"。
@@ -272,103 +274,111 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
     let mut notes: Vec<String> = Vec::new();
     let nyq = r.sr as f64 / 2.0;
 
+    // 「是否满足要求」和「备注」是给交付/质检的人看的, 不是给做音频的人看的。
+    // 两条写法上的规矩:
+    //   1. 不写行话。奈奎斯特、砖墙、1/3 倍频程、P95 这些一律换成大白话,
+    //      要解释原理去 README, 别占每一行的备注。
+    //   2. 备注只写"这个文件的事"。跟文件无关的方法论说明(比如"±3dB 怎么才能测")
+    //      以前每行都挂一遍, 整列没法读 —— 现在只在这个文件全部通过时挂一句,
+    //      因为那时候它才影响结论("别把这个'是'当成全部达标")。
+
     // 1. 必须是 WAV, 且里面装的是未压缩 PCM。
     //    .wav 容器照样能装 ADPCM / A-law / mp3, 光看容器判不出"未压缩"。
     if r.container != "WAV" {
-        fails.push(format!("容器不是WAV(实测{})", r.container));
+        fails.push(format!("不是WAV文件(实际是{})", r.container));
     }
     if !r.is_pcm {
-        fails.push(format!("编码是{}, 不是未压缩PCM", r.codec));
+        fails.push(format!("不是未压缩PCM(编码 {})", r.codec));
     }
 
     // 2. 立体声
     if r.channels != REQ_CHANNELS {
-        fails.push(format!("{}声道, 要求立体声", r.channels));
-    }
-    if r.side_ratio.is_some_and(|v| v < DUAL_MONO_SIDE) {
-        notes.push("疑似双单声道(左右声道完全相同, 声道数够但没有立体声信息)".into());
+        fails.push(format!("不是立体声({}声道)", r.channels));
     }
 
     // 3. 采样率
     if r.sr < MIN_SR {
-        fails.push(format!("采样率{}Hz<44.1kHz", r.sr));
+        fails.push(format!("采样率{}Hz, 低于44.1kHz", r.sr));
     }
 
     // 4. 时长与静音比例
     if r.dur < cfg.min_dur_s {
-        fails.push(format!("时长{}不足{:.0}秒", mmss(r.dur), cfg.min_dur_s));
+        fails.push(format!("时长{}, 不足{:.0}秒", mmss(r.dur), cfg.min_dur_s));
     }
     if r.silence > cfg.max_silence {
-        fails.push(format!("静音比例{:.1}%>{:.0}%", r.silence * 100.0, cfg.max_silence * 100.0));
+        fails.push(format!(
+            "静音{:.1}%, 超过{:.0}%",
+            r.silence * 100.0,
+            cfg.max_silence * 100.0
+        ));
     }
 
     // 5a. 信噪比。测不出来只记备注不判不合格 —— 跟项目A 处理底噪/RT60 的口径一致:
     //     测不出不等于不合格, 但要让看表的人知道这项没验上。
-    match r.snr {
-        None => notes.push("信噪比未测出(没有够 0.5 秒的静音段可估底噪), 需人工复核".into()),
-        Some(v) if v < cfg.min_snr_db => {
-            fails.push(format!("信噪比{v:.1}dB<{:.0}dB", cfg.min_snr_db))
-        }
-        Some(_) => {}
-    }
-
-    // 5b. 频响上限 + 有损压缩痕迹。两件事共用同一个砖墙检测, 分开报:
-    //     砖墙远低于奈奎斯特 = 这条轨过过有损编码(第6条);
-    //     砖墙就在奈奎斯特附近但够不到 20kHz = 采样率不够(第5条)。
-    match r.cutoff {
-        None => notes.push("高频截止未测出".into()),
-        Some(c) => {
-            if c < nyq * LOSSY_NYQUIST_RATIO {
-                fails.push(format!(
-                    "高频在{:.1}kHz处砖墙跌落(奈奎斯特{:.1}kHz), 疑似有损压缩来源",
-                    c / 1000.0,
-                    nyq / 1000.0
-                ));
-            } else if c < BAND_HI_HZ {
-                fails.push(format!("高频截止{:.1}kHz<20kHz", c / 1000.0));
-            }
+    if let Some(v) = r.snr {
+        if v < cfg.min_snr_db {
+            fails.push(format!("信噪比{v:.1}dB, 低于{:.0}dB", cfg.min_snr_db));
         }
     }
-    if r.sr == 44100 {
-        notes.push("44.1kHz 奈奎斯特只有 22.05kHz, 抗混叠滤波常在 20kHz 附近就开始滚降, 要稳过 20kHz 建议录 48kHz".into());
+
+    // 5b. 频响上限 + 有损压缩痕迹。两件事共用同一个"高频被切断"的检测, 分开报:
+    //     切断点远低于采样率上限 = 这条轨过过有损编码(第6条);
+    //     切断点就在采样率上限附近但够不到 20kHz = 采样率不够(第5条)。
+    if let Some(c) = r.cutoff {
+        if c < nyq * LOSSY_NYQUIST_RATIO {
+            fails.push(format!(
+                "高频只到{:.1}kHz就被切断, 是从有损压缩(mp3等)转成的WAV",
+                c / 1000.0
+            ));
+        } else if c < BAND_HI_HZ {
+            fails.push(format!("高频只到{:.1}kHz, 不足20kHz", c / 1000.0));
+        }
     }
 
-    // 5c. 「频响」列里报的是实测带宽(低频端-高频截止), 参与判定的只有高频端。
-    //     平坦度另报一个数进备注, 不参与判定, 原因见文件末尾"局限"。
-    if let Some(f) = r.flatness {
-        notes.push(format!(
-            "频响起伏{f:.1}dB(1/3倍频程 P95-P5, 反映的是素材本身频谱, 不是链路频响; ±{FLATNESS_DB:.0}dB 需用扫频/粉噪测试信号才能判)"
-        ));
+    // ---- 备注: 先写"这条可能有什么问题", 再写补充数据, 口径说明放最后 ----
+
+    if r.clip_events > 0 {
+        notes.push(format!("有{}处削波, 声音已经失真", r.clip_events));
     }
-    // 信噪比不合格时把底噪一并写出来, 否则只看一个 SNR 数字没法判断是"底噪高"
-    // 还是"录得太小声"。底噪本身没有单列一列。
+    if r.peak_db.is_some_and(|p| p >= LIMITED_PEAK_DB) {
+        notes.push("音量顶到最大, 像是后期拉过响度".into());
+    }
+    if r.zero_s > ZERO_RUN_S {
+        notes.push(format!("中间有{:.1}秒完全无声, 像是被降噪或手动静音过", r.zero_s));
+    }
+    if r.low_rolloff.is_some_and(|v| v > LOW_ROLLOFF_DB) {
+        notes.push("低频几乎没有, 可能被滤掉了(也可能录的内容本来就没低频)".into());
+    }
+    if r.side_ratio.is_some_and(|v| v < DUAL_MONO_SIDE) {
+        notes.push("左右声道完全一样, 实际听不出立体声".into());
+    }
+    if r.bits.is_some_and(|b| b < 16) {
+        notes.push(format!("位深只有{}位", r.bits.unwrap_or(0)));
+    }
+
+    // 测不出来的项要说一声, 否则空白列会被当成"通过了"
+    if r.snr.is_none() {
+        notes.push("信噪比测不出: 全程几乎没有安静的地方, 要人工听一下".into());
+    }
+    if r.cutoff.is_none() {
+        notes.push("频响测不出: 内容太短或几乎无声".into());
+    }
+    // 信噪比不合格时补一个底噪数字: 只看 SNR 分不清是"底噪吵"还是"录得太小声"
     if let (Some(v), Some(n)) = (r.snr, r.noise) {
         if v < cfg.min_snr_db {
             notes.push(format!("底噪{n:.1}dBFS"));
         }
     }
+    // 44.1kHz 够不到 20kHz 是规格本身的矛盾, 但只在真的卡在线上时才提 ——
+    // 高频稳过或明显不足的时候, 这句话帮不上任何忙。
+    if r.sr == 44100 && r.cutoff.is_some_and(|c| (19_000.0..21_000.0).contains(&c)) {
+        notes.push("44.1kHz本来就到不了20kHz, 换48kHz录才有余量".into());
+    }
 
-    // 6. 后期处理痕迹。这几项都只是线索, 一律进备注不判不合格。
-    if r.clip_events > 0 {
-        notes.push(format!("检测到{}处削波", r.clip_events));
-    }
-    if r.peak_db.is_some_and(|p| p >= LIMITED_PEAK_DB) {
-        notes.push("峰值贴满量程, 疑似做过限幅或归一化".into());
-    }
-    if r.low_rolloff.is_some_and(|v| v > LOW_ROLLOFF_DB) {
-        notes.push(format!(
-            "20-40Hz比100-300Hz低{:.0}dB, 可能做过高通滤波(也可能素材本身就没有低频内容)",
-            r.low_rolloff.unwrap_or(0.0)
-        ));
-    }
-    if r.zero_s > ZERO_RUN_S {
-        notes.push(format!(
-            "中段有{:.1}秒绝对数字零, 话筒录音不会出现, 疑似做过降噪门限或静音处理",
-            r.zero_s
-        ));
-    }
-    if r.bits.is_some_and(|b| b < 16) {
-        notes.push(format!("位深仅{}bit", r.bits.unwrap_or(0)));
+    // 全部通过时才提这一句: 「是」不等于连 ±3dB 平坦度也验过了。
+    // 已经有别的不合格项时不提, 免得挤占真正要看的内容。
+    if fails.is_empty() {
+        notes.push(format!("±{FLATNESS_DB:.0}dB平坦度未校验, 需录一段扫频测试音"));
     }
 
     vec![
@@ -444,12 +454,48 @@ fn mmss(s: f64) -> String {
 // 备注交人工复核, 不替人做"退货"的决定。
 
 #[cfg(test)]
+mod tests_support {
+    pub use super::tests::{stereo_take, tmp, write_wav, Tmp};
+
+    /// 几种典型样例, 给 sample_output 打印用。
+    pub fn samples() -> Vec<(&'static str, Tmp)> {
+        let mut v = Vec::new();
+        let f = tmp("s_ok");
+        write_wav(&f.0, 44100, 2, &stereo_take(44100, false));
+        v.push(("各项达标", f));
+
+        let f = tmp("s_dual");
+        write_wav(&f.0, 44100, 2, &stereo_take(44100, true));
+        v.push(("双单声道", f));
+
+        let f = tmp("s_mono");
+        let m: Vec<Vec<f64>> =
+            stereo_take(22050, false).into_iter().map(|fr| vec![fr[0]]).collect();
+        write_wav(&f.0, 22050, 1, &m);
+        v.push(("单声道 + 22.05kHz", f));
+
+        // 全程满量程正弦: 削波 + 顶到最大 + 没有静音段(信噪比测不出)。
+        // 左右给相位差 —— 完全反相的话下混成单声道后恒等于 0, 整行数据都没意义。
+        let f = tmp("s_clip");
+        let loud: Vec<Vec<f64>> = (0..44100 * 4)
+            .map(|i| {
+                let w = 2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44100.0;
+                vec![0.999 * w.sin(), 0.999 * (w + 0.3).sin()]
+            })
+            .collect();
+        write_wav(&f.0, 44100, 2, &loud);
+        v.push(("削波/顶满量程", f));
+        v
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// 写一个 16bit PCM WAV。测试要走完真实的解码路径, 光靠合成的 f64 数组
     /// 验不到容器识别、编码识别、位深、声道这几项。
-    fn write_wav(path: &Path, sr: u32, ch: u16, frames: &[Vec<f64>]) {
+    pub fn write_wav(path: &Path, sr: u32, ch: u16, frames: &[Vec<f64>]) {
         use std::io::Write;
         let n = frames.len() * ch as usize;
         let data_len = n * 2;
@@ -482,7 +528,7 @@ mod tests {
     /// 相对 -13.5dBFS 的信号是 ~78dB 信噪比, 稳稳过 70dB。
     /// 静音段 0.7 秒也是刻意的: 要过 analysis::MIN_SILENCE_S(0.5 秒)这道门槛,
     /// 而 0.7/4.0 = 17.5% 又还在 20% 的静音比例上限之内。
-    fn stereo_take(sr: u32, dual_mono: bool) -> Vec<Vec<f64>> {
+    pub fn stereo_take(sr: u32, dual_mono: bool) -> Vec<Vec<f64>> {
         const DITHER: f64 = 1.5 / 32767.0;
         let mut out = Vec::new();
         let total = (sr as f64 * 4.0) as usize;
@@ -505,13 +551,13 @@ mod tests {
         out
     }
 
-    struct Tmp(std::path::PathBuf);
+    pub struct Tmp(pub std::path::PathBuf);
     impl Drop for Tmp {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
-    fn tmp(tag: &str) -> Tmp {
+    pub fn tmp(tag: &str) -> Tmp {
         Tmp(std::env::temp_dir().join(format!("qc_raw_test_{tag}_{}.wav", std::process::id())))
     }
 
@@ -544,6 +590,14 @@ mod tests {
         assert_eq!(col("时长"), "0:04");
         assert!(col("静音比例").ends_with('%'), "{}", col("静音比例"));
         assert!(col("频响").ends_with("kHz"), "{}", col("频响"));
+
+        // 备注可读性护栏: 一条各项达标的文件, 备注里只该剩"±3dB 没验"这一句,
+        // 不该再挂方法论长文, 也不该出现行话。这一列曾经被这两样挤垮过。
+        let n = col("备注（如有）");
+        assert!(n.chars().count() < 40, "备注太长({}字): {n}", n.chars().count());
+        for jargon in ["奈奎斯特", "倍频程", "P95", "链路频响", "砖墙", "dBFS"] {
+            assert!(!n.contains(jargon), "备注里不该出现行话 {jargon}: {n}");
+        }
     }
 
     /// 默认时长下限是 1 分钟, 3 秒的文件必须因此不合格。
@@ -562,7 +616,7 @@ mod tests {
         write_wav(&f.0, 44100, 2, &stereo_take(44100, true));
         let cfg = Settings { min_dur_s: 1.0, ..Default::default() };
         let row = check_file(&f.0, None, &cfg);
-        assert!(row[NOTES_COL].contains("双单声道"), "备注: {}", row[NOTES_COL]);
+        assert!(row[NOTES_COL].contains("左右声道完全一样"), "备注: {}", row[NOTES_COL]);
         // 声道数还是 2, 但"是否立体声"这一列必须把它跟真立体声区分开
         assert_eq!(row[COLUMNS.iter().position(|c| *c == "是否立体声").unwrap()], "是(左右相同)");
         assert_eq!(row[COLUMNS.iter().position(|c| *c == "声道数").unwrap()], "2");
@@ -579,7 +633,7 @@ mod tests {
         let r = analyse(&f.0, &cfg).unwrap();
         assert_eq!(r.side_ratio, None);
         let row = check_file(&f.0, None, &cfg);
-        assert!(row[VERDICT_COL].contains("要求立体声"), "{}", row[VERDICT_COL]);
+        assert!(row[VERDICT_COL].contains("不是立体声"), "{}", row[VERDICT_COL]);
         assert_eq!(row[COLUMNS.iter().position(|c| *c == "是否立体声").unwrap()], "否");
     }
 
@@ -634,5 +688,27 @@ mod tests {
     #[test]
     fn all_zero_track_reports_none() {
         assert_eq!(interior_zero_seconds(&[-200.0; 10]), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod sample_output {
+    use super::tests_support::*;
+    use super::*;
+
+    /// 不是断言, 是把几种典型情况的整行打出来人眼过一遍可读性。
+    /// `cargo test -p audio_qc_raw sample -- --nocapture`
+    #[test]
+    fn print_rows() {
+        let cfg = Settings { min_dur_s: 1.0, ..Default::default() };
+        for (tag, path) in samples() {
+            let row = check_file(&path.0, None, &cfg);
+            println!("\n【{tag}】");
+            for (c, v) in COLUMNS.iter().zip(&row) {
+                if !v.is_empty() {
+                    println!("  {c:　<6} {v}");
+                }
+            }
+        }
     }
 }
