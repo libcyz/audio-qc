@@ -21,11 +21,16 @@ use audio_qc::analysis::{
 };
 
 // ---- CSV 表头 ---------------------------------------------------------------
-pub const COLUMNS: [&str; 15] = [
-    "文件名", "容器", "编码", "位深", "声道数", "采样率", "时长",
-    "静音比例", "信噪比dB", "底噪dBFS", "峰值dBFS", "高频截止kHz", "频响起伏dB",
+pub const COLUMNS: [&str; 11] = [
+    "文件名", "文件类型", "是否立体声", "声道数", "采样率", "时长",
+    "静音比例", "信噪比dB", "频响",
     "是否满足要求", "备注（如有）",
 ];
+// 交付方指定的字段是"文件类型 是否立体声 声道数 采样率 时长 静音比例 信噪比dB
+// 频响 是否满足要求"这九项。另外两列是加上去的:
+//   文件名 —— 没有它整张表对不上是哪个文件, 不算多余字段;
+//   备注   —— 频响 ±3dB 的口径、双单声道、疑似限幅这些必须有地方说, 否则只剩
+//             一个光秃秃的"否"没法复核。要去掉的话把这一列删了即可, 判定不受影响。
 // 跟项目A 一样的约定: "是否满足要求"/"备注" 永远是最后两列, 用相对位置算下标。
 pub const VERDICT_COL: usize = COLUMNS.len() - 2;
 pub const NOTES_COL: usize = COLUMNS.len() - 1;
@@ -91,6 +96,8 @@ pub struct Raw {
     pub snr: Option<f64>,
     pub peak_db: Option<f64>,
     pub cutoff: Option<f64>,
+    /// 低频端: 内容真正延伸到的最低 1/3 倍频程中心频率。
+    pub low_edge: Option<f64>,
     pub flatness: Option<f64>,
     /// 20~40Hz 相对 100~300Hz 的落差 dB, 正数表示低频更弱。
     pub low_rolloff: Option<f64>,
@@ -141,6 +148,7 @@ pub fn analyse(path: &Path, _cfg: &Settings) -> Result<Raw, String> {
     let spec = ltas_db(&d.mono);
     let flatness = spec.as_ref().and_then(|s| flatness_db(s, d.sr));
     let low_rolloff = spec.as_ref().and_then(|s| low_rolloff_db(s, d.sr));
+    let low_edge = spec.as_ref().and_then(|s| low_edge_hz(s, d.sr));
 
     Ok(Raw {
         container,
@@ -156,6 +164,7 @@ pub fn analyse(path: &Path, _cfg: &Settings) -> Result<Raw, String> {
         snr,
         peak_db,
         cutoff,
+        low_edge,
         flatness,
         low_rolloff,
         clip_events: d.clip_events,
@@ -213,6 +222,20 @@ fn flatness_db(spec: &[f64], sr: u32) -> Option<f64> {
     lv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     // 用 P95-P5 而不是 max-min: 单个坏带(比如 50Hz 工频)不该把整个数字带跑
     Some(percentile(&lv, 95.0) - percentile(&lv, 5.0))
+}
+
+/// 内容真正延伸到的低频端: 从最低的 1/3 倍频程带往上找, 第一个"跟 100~300Hz
+/// 参考段相差在 LOW_ROLLOFF_DB 以内"的带心频率。用来填「频响」列的下限 ——
+/// 报 20Hz 得是真的有 20Hz 内容, 不能因为规格写着 20Hz 就照抄一个 20Hz 上去。
+fn low_edge_hz(spec: &[f64], sr: u32) -> Option<f64> {
+    let bands = third_octave(spec, sr);
+    let refs: Vec<f64> =
+        bands.iter().filter(|(f, _)| (100.0..=300.0).contains(f)).map(|(_, v)| *v).collect();
+    if refs.is_empty() {
+        return None;
+    }
+    let r = refs.iter().sum::<f64>() / refs.len() as f64;
+    bands.iter().find(|(_, v)| r - *v <= LOW_ROLLOFF_DB).map(|(f, _)| *f)
 }
 
 /// 20~40Hz 相对 100~300Hz 的落差 dB。高通滤波会让这个数变得很大, 但人声素材
@@ -310,11 +333,19 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
         notes.push("44.1kHz 奈奎斯特只有 22.05kHz, 抗混叠滤波常在 20kHz 附近就开始滚降, 要稳过 20kHz 建议录 48kHz".into());
     }
 
-    // 5c. 频响 ±3dB: 只报数, 不判定。原因见文件末尾"局限"。
+    // 5c. 「频响」列里报的是实测带宽(低频端-高频截止), 参与判定的只有高频端。
+    //     平坦度另报一个数进备注, 不参与判定, 原因见文件末尾"局限"。
     if let Some(f) = r.flatness {
         notes.push(format!(
             "频响起伏{f:.1}dB(1/3倍频程 P95-P5, 反映的是素材本身频谱, 不是链路频响; ±{FLATNESS_DB:.0}dB 需用扫频/粉噪测试信号才能判)"
         ));
+    }
+    // 信噪比不合格时把底噪一并写出来, 否则只看一个 SNR 数字没法判断是"底噪高"
+    // 还是"录得太小声"。底噪本身没有单列一列。
+    if let (Some(v), Some(n)) = (r.snr, r.noise) {
+        if v < cfg.min_snr_db {
+            notes.push(format!("底噪{n:.1}dBFS"));
+        }
     }
 
     // 6. 后期处理痕迹。这几项都只是线索, 一律进备注不判不合格。
@@ -342,21 +373,49 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
 
     vec![
         name,
-        r.container.to_string(),
-        r.codec.to_string(),
-        r.bits.map(|b| b.to_string()).unwrap_or_default(),
+        fmt_file_type(&r),
+        fmt_stereo(&r),
         r.channels.to_string(),
         r.sr.to_string(),
         mmss(r.dur),
         format!("{:.1}%", r.silence * 100.0),
         fmt_opt(r.snr, 1),
-        fmt_opt(r.noise, 1),
-        fmt_opt(r.peak_db, 1),
-        fmt_opt(r.cutoff.map(|c| c / 1000.0), 2),
-        fmt_opt(r.flatness, 1),
+        fmt_band(&r),
         if fails.is_empty() { "是".into() } else { format!("否：{}", fails.join("；")) },
         notes.join("；"),
     ]
+}
+
+/// 「文件类型」一列要同时回答第 1 条(必须是 WAV)和第 6 条(未压缩), 所以容器和
+/// 编码都写进去: "WAV/pcm_s16le 16bit"。位深附在后面, 不单独占一列。
+fn fmt_file_type(r: &Raw) -> String {
+    let mut t = format!("{}/{}", r.container, r.codec);
+    if let Some(b) = r.bits {
+        t.push_str(&format!(" {b}bit"));
+    }
+    t
+}
+
+/// 「是否立体声」。双单声道声道数确实是 2, 判定上不算不合格(见备注), 但这一列
+/// 必须把它跟真立体声区分开 —— 否则一条左右完全相同的轨在表里跟合格的长得一样。
+fn fmt_stereo(r: &Raw) -> String {
+    if r.channels != REQ_CHANNELS {
+        return "否".into();
+    }
+    match r.side_ratio {
+        Some(v) if v < DUAL_MONO_SIDE => "是(左右相同)".into(),
+        _ => "是".into(),
+    }
+}
+
+/// 「频响」一列报实测带宽。低频端是内容真正延伸到的最低 1/3 倍频程带, 高频端是
+/// 砖墙检测的截止点 —— 不是照抄规格里的 "20Hz-20kHz"。测不出就留空。
+fn fmt_band(r: &Raw) -> String {
+    match (r.low_edge, r.cutoff) {
+        (Some(lo), Some(hi)) => format!("{lo:.0}Hz-{:.1}kHz", hi / 1000.0),
+        (None, Some(hi)) => format!("?-{:.1}kHz", hi / 1000.0),
+        _ => String::new(),
+    }
 }
 
 fn fmt_opt(v: Option<f64>, n: usize) -> String {
@@ -475,6 +534,16 @@ mod tests {
 
         let row = check_file(&f.0, None, &cfg);
         assert_eq!(row[VERDICT_COL], "是", "备注: {}", row[NOTES_COL]);
+        // 交付方指定的那几列要填对
+        let col = |n: &str| row[COLUMNS.iter().position(|c| *c == n).unwrap()].clone();
+        assert!(col("文件类型").starts_with("WAV/"), "{}", col("文件类型"));
+        assert!(col("文件类型").ends_with("16bit"), "{}", col("文件类型"));
+        assert_eq!(col("是否立体声"), "是");
+        assert_eq!(col("声道数"), "2");
+        assert_eq!(col("采样率"), "44100");
+        assert_eq!(col("时长"), "0:04");
+        assert!(col("静音比例").ends_with('%'), "{}", col("静音比例"));
+        assert!(col("频响").ends_with("kHz"), "{}", col("频响"));
     }
 
     /// 默认时长下限是 1 分钟, 3 秒的文件必须因此不合格。
@@ -494,6 +563,9 @@ mod tests {
         let cfg = Settings { min_dur_s: 1.0, ..Default::default() };
         let row = check_file(&f.0, None, &cfg);
         assert!(row[NOTES_COL].contains("双单声道"), "备注: {}", row[NOTES_COL]);
+        // 声道数还是 2, 但"是否立体声"这一列必须把它跟真立体声区分开
+        assert_eq!(row[COLUMNS.iter().position(|c| *c == "是否立体声").unwrap()], "是(左右相同)");
+        assert_eq!(row[COLUMNS.iter().position(|c| *c == "声道数").unwrap()], "2");
     }
 
     /// 单声道要判不合格(第 2 条要求立体声), 且 side_ratio 应为 None。
@@ -508,6 +580,7 @@ mod tests {
         assert_eq!(r.side_ratio, None);
         let row = check_file(&f.0, None, &cfg);
         assert!(row[VERDICT_COL].contains("要求立体声"), "{}", row[VERDICT_COL]);
+        assert_eq!(row[COLUMNS.iter().position(|c| *c == "是否立体声").unwrap()], "否");
     }
 
     /// 22.05kHz 采样: 采样率不合格, 且奈奎斯特只有 11kHz, 高频也够不到 20kHz。
@@ -525,6 +598,18 @@ mod tests {
     fn columns_and_verdict_position() {
         assert_eq!(COLUMNS[VERDICT_COL], "是否满足要求");
         assert_eq!(COLUMNS[NOTES_COL], "备注（如有）");
+    }
+
+    /// 交付方指定的九个字段一个都不能少、顺序也不能乱。
+    #[test]
+    fn delivery_required_columns_present_in_order() {
+        let want = [
+            "文件类型", "是否立体声", "声道数", "采样率", "时长",
+            "静音比例", "信噪比dB", "频响", "是否满足要求",
+        ];
+        let got: Vec<&str> =
+            COLUMNS.iter().copied().filter(|c| want.contains(c)).collect();
+        assert_eq!(got, want);
     }
 
     #[test]
