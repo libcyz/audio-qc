@@ -1,0 +1,16 @@
+[package]
+name = "audio_qc_raw"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "audio_qc_raw"
+path = "src/main.rs"
+
+[dependencies]
+audio_qc = { path = "../.." }
+csv.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+walkdir.workspace = true
