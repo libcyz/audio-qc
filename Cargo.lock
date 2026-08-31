@@ -108,6 +108,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_qc_raw"
+version = "0.1.0"
+dependencies = [
+ "audio_qc",
+ "csv",
+ "eframe",
+ "egui",
+ "rfd",
+ "walkdir",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -82,15 +82,15 @@ const CLIP_THRESHOLD: f64 = 0.9441;      // -0.5dBFS
 const CLIP_MIN_RUN: usize = 3;           // 连续触顶达到这个采样数才算削波; 1~2个可能只是自然的峰值瞬间
 
 // ---- 分析参数 ---------------------------------------------------------------
-const WIN: f64 = 0.020;                  // 包络分析窗 (秒)
-const HOP: f64 = 0.010;                  // 步进 (秒)
+pub const WIN: f64 = 0.020;                  // 包络分析窗 (秒)
+pub const HOP: f64 = 0.010;                  // 步进 (秒)
 const ACT_REL_DB: f64 = 35.0;            // 活动判定: 高于本轨 P95 电平 - 35 dB
 const ACT_ABS_DBFS: f64 = -55.0;         // 且高于该绝对电平
-const SILENCE_DBFS: f64 = -90.0;         // 低于此视为数字静音(剪辑留白), 不算本底噪声
-const MIN_SILENCE_S: f64 = 0.5;          // 静音不足这么久就别报底噪了, 样本太少不可信
+pub const SILENCE_DBFS: f64 = -90.0;         // 低于此视为数字静音(剪辑留白), 不算本底噪声
+pub const MIN_SILENCE_S: f64 = 0.5;          // 静音不足这么久就别报底噪了, 样本太少不可信
 const MIN_DURATION_S: f64 = 1.0;         // 短于此的文件没有分析价值
 
-const CUT_NFFT: usize = 8192;
+pub const CUT_NFFT: usize = 8192;
 const CUT_MAX_FRAMES: usize = 300;
 const CUT_MIN_HZ: f64 = 8000.0;          // 只在 8kHz 以上找"砖墙"
 const CUT_SPAN_HZ: f64 = 1000.0;         // 跌落观察跨度
@@ -117,6 +117,28 @@ pub struct Decoded {
     /// 削波事件数: 某个声道连续 >=CLIP_MIN_RUN 个采样触顶算一次, 不是采样计数
     /// (否则一段长削波会把数字撑得没有意义)。同理必须用原始采样, 不能用 mono。
     pub clip_events: usize,
+    /// symphonia 认出来的真实编码名, 不是文件后缀。改名的 mp3 在这里现原形。
+    pub codec: &'static str,
+    /// 编码是不是未压缩 PCM。.wav 容器里照样能装 ADPCM / A-law / 甚至 mp3,
+    /// 所以"未压缩"只能看编码, 光看后缀判不出来。
+    pub is_pcm: bool,
+    /// 每个采样的位深, 容器没写就是 None。
+    pub bits: Option<u32>,
+    /// 侧信号 (L-R)/2 的能量占总能量的比例; 不是双声道时为 None。
+    /// 用来识别"双单声道": 声道数是 2 但左右完全相同, 声道数看着合格,
+    /// 实际没有任何立体声信息。真立体声这个值在 0.01~0.3 量级。
+    pub side_ratio: Option<f64>,
+}
+
+/// PCM 编码 ID 的连续区间。symphonia 把未压缩 PCM 排在 0x100..=0x123,
+/// 紧跟其后的 A-law/μ-law(0x124/0x125) 是压扩编码, 不算未压缩, 所以区间到
+/// F64BE_PLANAR 为止 —— 下面的单元测试盯着这个边界, 升级 symphonia 后如果
+/// 编号挪了会当场失败。
+fn is_pcm_codec(id: symphonia::core::codecs::audio::AudioCodecId) -> bool {
+    use symphonia::core::codecs::audio::well_known::{
+        CODEC_ID_PCM_F64BE_PLANAR, CODEC_ID_PCM_S32LE,
+    };
+    (CODEC_ID_PCM_S32LE..=CODEC_ID_PCM_F64BE_PLANAR).contains(&id)
 }
 
 /// 解码成单声道 f64。下混按能量归一 —— 直接取平均的话, 左右不相关的立体声轨
@@ -151,6 +173,13 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
         _ => return Err("文件里没有音频轨".into()),
     };
 
+    let codec = symphonia::default::get_codecs()
+        .get_audio_decoder(params.codec)
+        .map(|d| d.codec.info.short_name)
+        .unwrap_or("未知");
+    let is_pcm = is_pcm_codec(params.codec);
+    let bits = params.bits_per_sample;
+
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
         .map_err(|e| format!("没有对应的解码器({e})"))?;
@@ -164,6 +193,7 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
     let mut inter: Vec<f32> = Vec::new();
     let mut clip_run: Vec<usize> = Vec::new();   // 每个声道各自的"当前连续触顶计数"
     let mut clip_events = 0usize;
+    let mut side_ss = 0.0f64;          // 侧信号 (L-R)/2 的平方和, 只在双声道时累加
 
     loop {
         let packet = match format.next_packet() {
@@ -195,6 +225,10 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
                             clip_events += 1;
                         }
                     }
+                    if fr.len() == 2 {
+                        let d = (fr[0] as f64 - fr[1] as f64) * 0.5;
+                        side_ss += d * d;
+                    }
                     n_all += fr.len();
                     mono.push(s / fr.len() as f64);
                 }
@@ -220,7 +254,9 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
             }
         }
     }
-    Ok(Decoded { mono, sr, channels, peak, clip_events })
+    // 全零文件(sum_sq_all == 0)没有立体声可言, 报 None 而不是 0/0
+    let side_ratio = (channels == 2 && sum_sq_all > 0.0).then(|| side_ss / sum_sq_all);
+    Ok(Decoded { mono, sr, channels, peak, clip_events, codec, is_pcm, bits, side_ratio })
 }
 
 // ============================================================ 指标
@@ -245,7 +281,7 @@ pub fn frame_db(x: &[f64], sr: u32) -> Vec<f64> {
 }
 
 /// 与 numpy.percentile 一致的线性插值分位数。
-fn percentile(sorted: &[f64], p: f64) -> f64 {
+pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
     }
@@ -260,7 +296,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 /// 活动判定门限: 高于 本轨P95-35dB 与 -55dBFS 中较高者。
-fn active_threshold(db: &[f64]) -> f64 {
+pub fn active_threshold(db: &[f64]) -> f64 {
     let mut s = db.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     (percentile(&s, 95.0) - ACT_REL_DB).max(ACT_ABS_DBFS)
@@ -280,6 +316,17 @@ pub fn active_seconds(db: &[f64]) -> f64 {
 /// 静音总时长不足 MIN_SILENCE_S 就返回 None —— 连续演奏的轨根本没有静音段可测,
 /// 这时报出来的数字只会是"最安静的乐句", 不是底噪。
 pub fn noise_floor_db(db: &[f64]) -> Option<f64> {
+    noise_floor_db_above(db, SILENCE_DBFS)
+}
+
+/// 同上, 但"数字静音"的下限可以指定。
+///
+/// 项目A 用 -90dBFS: 音乐母带里低于这个电平的帧就是剪辑挖出来的绝对零, 算进去
+/// 会把底噪拉低成一个假数字。但校验信噪比时这个下限就太高了 —— 要求 SNR>=70dB
+/// 意味着底噪本来就该压到 -90 附近, 拿 -90 去滤等于把最该统计的那批帧全扔掉,
+/// 剩下的都是相对吵的帧, 信噪比会系统性偏低、合格文件被误判。那种场合传一个
+/// 远低于任何真实转换器本底的值(见 crates/audio_qc_raw 的 DIGITAL_ZERO_DBFS)。
+pub fn noise_floor_db_above(db: &[f64], floor_dbfs: f64) -> Option<f64> {
     if db.is_empty() {
         return None;
     }
@@ -287,7 +334,7 @@ pub fn noise_floor_db(db: &[f64]) -> Option<f64> {
     let sil: Vec<f64> = db
         .iter()
         .copied()
-        .filter(|&v| v <= thr && v > SILENCE_DBFS)
+        .filter(|&v| v <= thr && v > floor_dbfs)
         .collect();
     if sil.len() as f64 * HOP < MIN_SILENCE_S {
         return None;
@@ -311,7 +358,7 @@ pub fn rms_db(x: &[f64]) -> f64 {
 /// db 是调用方已经算好的逐帧包络(frame_db 的结果), 这里复用, 不重复算一遍;
 /// 每个活跃帧只计入 HOP 那部分采样(不是整个 WIN 窗口), 跟 active_seconds 数
 /// 时长的口径保持一致 —— 帧与帧之间有重叠, 按 WIN 算会把重叠区间重复计数。
-fn active_rms_db(x: &[f64], sr: u32, mask: &[bool]) -> f64 {
+pub fn active_rms_db(x: &[f64], sr: u32, mask: &[bool]) -> f64 {
     if mask.is_empty() {
         return rms_db(x);   // 太短测不出包络, 退回整段算
     }
@@ -334,7 +381,7 @@ fn active_rms_db(x: &[f64], sr: u32, mask: &[bool]) -> f64 {
 }
 
 /// 能量阈值活动掩码, 与 active_seconds / noise_floor_db 同一套判据。
-fn energy_mask(db: &[f64]) -> Vec<bool> {
+pub fn energy_mask(db: &[f64]) -> Vec<bool> {
     let thr = active_threshold(db);
     db.iter().map(|&v| v > thr).collect()
 }
@@ -410,7 +457,7 @@ fn clip_step(run: &mut usize, sample: f64, threshold: f64) -> bool {
 }
 
 /// 长时平均谱 (dB), 只取有内容的帧, 最多 CUT_MAX_FRAMES 帧。
-fn ltas_db(x: &[f64]) -> Option<Vec<f64>> {
+pub fn ltas_db(x: &[f64]) -> Option<Vec<f64>> {
     let n = CUT_NFFT;
     if x.len() < n * 2 {
         return None;
@@ -690,6 +737,8 @@ const SUFFIX_PATTERNS: &[(&str, Role)] = &[
     ("voc", Role::Voc),               // 人声清唱
     ("vol", Role::Voc),                // 实际交付里出现过的手滑拼法(voc 误打成 vol)
     ("人声", Role::Voc),
+    ("干声", Role::Voc),
+    ("清唱", Role::Voc),
     ("instrumental", Role::Ins),
     ("inst", Role::Ins),              // 伴奏
     ("ins", Role::Ins),                // 伴奏的另一种缩写(与 inst 不冲突: "..inst"结尾不会被"ins"提前吃掉)
@@ -721,6 +770,23 @@ fn strip_bracket(stem: &str, tokens: &[&str]) -> Option<String> {
 /// xxx_(Instrumental)(1).mp3 会被全判成同一首歌的伴奏轨, 只剩一条; 而
 /// Insane / Wins 这种词也会被误伤。
 pub fn split_role(stem: &str) -> (String, Role) {
+    if let Some(r) = match_role(stem) {
+        return r;
+    }
+    // 角色标记后面挂了副本编号("-Voc(1)"、"_voc_01")时, 去掉编号再认一次。
+    // 只有去掉之后真能认出角色才采纳 —— 否则保持原样, 不然 "歌名_1"/"歌名_2"
+    // 这种本来就不同的歌会被削成同一个歌名并进一组。
+    let cut = strip_copy_suffix(stem);
+    if cut.len() < stem.len() {
+        if let Some(r) = match_role(cut) {
+            return r;
+        }
+    }
+    (stem.to_string(), Role::Mix)
+}
+
+/// 认不出角色就返回 None(交给 split_role 决定怎么兜底)。
+fn match_role(stem: &str) -> Option<(String, Role)> {
     let low = stem.to_ascii_lowercase();
     for &(t, role) in SUFFIX_PATTERNS {
         if low.ends_with(t) {
@@ -728,17 +794,36 @@ pub fn split_role(stem: &str) -> (String, Role) {
             let trimmed = base.trim_end_matches([' ', '_', '-']);
             // 拉丁词要求前面有分隔符(避免 Wins 结尾被当成 ins); 中文标记不要求
             if !t.is_ascii() || trimmed.len() < base.len() {
-                return (trimmed.to_string(), role);
+                return Some((trimmed.to_string(), role));
             }
         }
     }
     if let Some(b) = strip_bracket(stem, &VOC_BRACKET) {
-        return (b, Role::Voc);
+        return Some((b, Role::Voc));
     }
-    if let Some(b) = strip_bracket(stem, &INS_BRACKET) {
-        return (b, Role::Ins);
+    strip_bracket(stem, &INS_BRACKET).map(|b| (b, Role::Ins))
+}
+
+/// 去掉结尾的副本编号: "(1)" "[2]" "-1" "_01" " 3"。批量导出和 Windows 复制都会
+/// 加这种尾巴, 挡在角色标记后面就会让整条轨认不出来。
+fn strip_copy_suffix(stem: &str) -> &str {
+    let t = stem.trim_end();
+    // 括号编号 (1) / [2]
+    if t.ends_with(')') || t.ends_with(']') {
+        if let Some(p) = t.rfind(['(', '[']) {
+            let inner = &t[p + 1..t.len() - 1];
+            if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()) {
+                return t[..p].trim_end_matches([' ', '_', '-']);
+            }
+        }
     }
-    (stem.to_string(), Role::Mix)
+    // 分隔符 + 纯数字结尾: -1 / _01 / 空格3。必须有分隔符, 不然
+    // "G000001" 这种 ID 会被啃掉尾巴。
+    let head = t.trim_end_matches(|c: char| c.is_ascii_digit());
+    if head.len() < t.len() && head.ends_with([' ', '_', '-']) {
+        return head.trim_end_matches([' ', '_', '-']);
+    }
+    t
 }
 
 /// 一组待校验的音频 = 一首歌。
@@ -993,6 +1078,20 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
 mod tests {
     use super::*;
 
+    /// is_pcm_codec 靠 symphonia 的编号区间判断, 升级依赖后编号一旦挪动
+    /// 这里会当场失败 —— 别改成"跟着新编号调区间"就完事, 要确认 A-law/μ-law
+    /// 这类压扩编码仍然在区间外。
+    #[test]
+    fn pcm_codec_range_excludes_companded() {
+        use symphonia::core::codecs::audio::well_known::*;
+        for id in [CODEC_ID_PCM_S16LE, CODEC_ID_PCM_S24LE, CODEC_ID_PCM_S32LE, CODEC_ID_PCM_F32LE] {
+            assert!(is_pcm_codec(id), "{id:?} 应该算未压缩 PCM");
+        }
+        for id in [CODEC_ID_PCM_ALAW, CODEC_ID_PCM_MULAW, CODEC_ID_ADPCM_MS, CODEC_ID_MP3] {
+            assert!(!is_pcm_codec(id), "{id:?} 不该算未压缩 PCM");
+        }
+    }
+
     fn sine(sr: u32, secs: f64, freq: f64, amp: f64) -> Vec<f64> {
         (0..(sr as f64 * secs) as usize)
             .map(|i| amp * (2.0 * std::f64::consts::PI * freq * i as f64 / sr as f64).sin())
@@ -1190,6 +1289,27 @@ mod tests {
 
         // 太短(不足一个 VAD 帧)也要返回 None, 不能 panic
         assert!(vad_mask(&[0.1; 100], sr, 1, 1).is_none());
+    }
+
+    #[test]
+    fn role_survives_copy_suffix() {
+        // 角色标记后面挂了副本编号也要认出来, 而且要跟没挂编号的归到同一首歌 ——
+        // 认不出来就会掉进 Mix 分支, 伴奏那列被填上"合轨整体活动", 看着像真的测过
+        for s in ["下雨天-Voc(1)", "下雨天-Voc-1", "下雨天_voc_01", "下雨天-Voc 2"] {
+            assert_eq!(split_role(s), ("下雨天".into(), Role::Voc), "{s}");
+        }
+        assert_eq!(split_role("下雨天-Ins(1)"), ("下雨天".into(), Role::Ins));
+        // 常见中文说法
+        assert_eq!(split_role("下雨天-干声"), ("下雨天".into(), Role::Voc));
+        assert_eq!(split_role("下雨天-清唱"), ("下雨天".into(), Role::Voc));
+
+        // 去掉编号也认不出角色时, 必须保留原名 —— 否则 "歌名_1"/"歌名_2"
+        // 这种本来不同的歌会被削成同一个歌名并进一组
+        assert_eq!(split_role("歌名_1"), ("歌名_1".into(), Role::Mix));
+        assert_eq!(split_role("歌名_2"), ("歌名_2".into(), Role::Mix));
+        assert_eq!(group_audio(&[PathBuf::from("歌名_1.wav"), PathBuf::from("歌名_2.wav")]).len(), 2);
+        // ID 尾部的数字不能被当成副本编号啃掉
+        assert_eq!(split_role("ZH_T1_S000001_G000001").0, "ZH_T1_S000001_G000001");
     }
 
     #[test]

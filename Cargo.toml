@@ -1,9 +1,8 @@
-[package]
-name = "audio_qc"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["crates/audio_qc_raw"]
 
-[dependencies]
+# 两个项目共用同一批依赖版本, 免得 A 升了 egui 而 B 没升。
+[workspace.dependencies]
 csv = "1.4.0"
 # 默认后端是 wgpu(Windows 上走 DX12), 某些显卡驱动下整个画面会闪。
 # 换成 glow(OpenGL) 后端, 顺带少编译一大堆 wgpu 依赖。
@@ -19,6 +18,21 @@ rustfft = "6.4.1"
 symphonia = { version = "0.6.0", features = ["all"] }
 walkdir = "2.5.0"
 webrtc-vad = "0.4.0"
+
+[package]
+name = "audio_qc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+csv.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+rustfft.workspace = true
+symphonia.workspace = true
+walkdir.workspace = true
+webrtc-vad.workspace = true
 
 [profile.release]
 opt-level = 3
