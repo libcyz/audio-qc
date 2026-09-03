@@ -3,10 +3,11 @@
 //! 校验项 (交付方规格):
 //!   1. 文件格式必须是 WAV
 //!   2. 通道数: 立体声
-//!   3. 采样率 >= 44.1kHz
+//!   3. 采样率 >= 44.1kHz, 采样位深 >= 16bit
 //!   4. 单条时长 >= 1 分钟, 静音段 <= 20%
 //!   5. 信噪比 >= 70dB, 频响 20Hz-20kHz ±3dB
 //!   6. 未经后续算法处理或滤波, 未压缩
+//!   7. 响度 >= -40dB —— 只记备注, 不纳入严格不合格判定
 //!
 //! 解码和 DSP 全部借项目A 的 `audio_qc::analysis` —— 那一层只测不判, 判定全在
 //! 本文件, 跟项目A 的 `check_song` 没有任何关系, 两边的阈值可以各改各的。
@@ -21,16 +22,18 @@ use audio_qc::analysis::{
 };
 
 // ---- CSV 表头 ---------------------------------------------------------------
-pub const COLUMNS: [&str; 11] = [
-    "文件名", "文件类型", "是否立体声", "声道数", "采样率", "时长",
-    "静音比例", "信噪比dB", "频响",
+pub const COLUMNS: [&str; 13] = [
+    "文件名", "文件类型", "是否立体声", "声道数", "采样率", "采样位深", "时长",
+    "静音比例", "信噪比dB", "响度dB", "频响",
     "是否满足要求", "备注（如有）",
 ];
 // 交付方指定的字段是"文件类型 是否立体声 声道数 采样率 时长 静音比例 信噪比dB
-// 频响 是否满足要求"这九项。另外两列是加上去的:
-//   文件名 —— 没有它整张表对不上是哪个文件, 不算多余字段;
-//   备注   —— 频响 ±3dB 的口径、双单声道、疑似限幅这些必须有地方说, 否则只剩
-//             一个光秃秃的"否"没法复核。要去掉的话把这一列删了即可, 判定不受影响。
+// 频响 是否满足要求"这九项。另外几列是加上去的:
+//   文件名   —— 没有它整张表对不上是哪个文件, 不算多余字段;
+//   采样位深 —— 16bit 门限是硬判定项(见下), 单独占一列比塞在"文件类型"里好复核;
+//   响度dB   —— -40dB 门限只记备注不判不合格, 但要有个地方报实测值;
+//   备注     —— 频响 ±3dB 的口径、双单声道、疑似限幅这些必须有地方说, 否则只剩
+//               一个光秃秃的"否"没法复核。要去掉的话把这一列删了即可, 判定不受影响。
 // 跟项目A 一样的约定: "是否满足要求"/"备注" 永远是最后两列, 用相对位置算下标。
 pub const VERDICT_COL: usize = COLUMNS.len() - 2;
 pub const NOTES_COL: usize = COLUMNS.len() - 1;
@@ -38,6 +41,8 @@ pub const NOTES_COL: usize = COLUMNS.len() - 1;
 // ---- 判定阈值 ---------------------------------------------------------------
 pub const REQ_CHANNELS: usize = 2;       // 立体声
 pub const MIN_SR: u32 = 44100;           // 采样率 >=
+pub const MIN_BITS: u32 = 16;            // 采样位深 >=, 硬判定项
+pub const MIN_LOUDNESS_DB: f64 = -40.0;  // 响度(活动段RMS) >=, 只记备注不判不合格
 pub const MIN_DUR_S: f64 = 60.0;         // 单条时长 >= 1 分钟
 pub const MAX_SILENCE: f64 = 0.20;       // 静音段 <=
 pub const MIN_SNR_DB: f64 = 70.0;        // 信噪比 >=
@@ -94,6 +99,8 @@ pub struct Raw {
     pub silence: f64,
     pub noise: Option<f64>,
     pub snr: Option<f64>,
+    /// 活动段 RMS 电平 (dBFS), 当作"响度"用。测不出(全程无信号)时为 None。
+    pub loudness: Option<f64>,
     pub peak_db: Option<f64>,
     pub cutoff: Option<f64>,
     /// 低频端: 内容真正延伸到的最低 1/3 倍频程中心频率。
@@ -141,6 +148,8 @@ pub fn analyse(path: &Path, _cfg: &Settings) -> Result<Raw, String> {
     let mask = energy_mask(&db);
     let signal = active_rms_db(&d.mono, d.sr, &mask);
     let snr = noise.map(|n| signal - n);
+    // 有峰值就说明有信号, signal 才有意义; 全零轨的 active_rms_db 会退回整段 RMS = -inf
+    let loudness = (d.peak > 0.0 && signal.is_finite()).then_some(signal);
 
     let peak_db = (d.peak > 0.0).then(|| 20.0 * d.peak.log10());
     let cutoff = cutoff_hz(&d.mono, d.sr);
@@ -160,6 +169,7 @@ pub fn analyse(path: &Path, _cfg: &Settings) -> Result<Raw, String> {
         silence,
         noise,
         snr,
+        loudness,
         peak_db,
         cutoff,
         low_edge,
@@ -296,9 +306,15 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
         fails.push(format!("不是立体声({}声道)", r.channels));
     }
 
-    // 3. 采样率
+    // 3. 采样率 + 采样位深
     if r.sr < MIN_SR {
         fails.push(format!("采样率{}Hz, 低于44.1kHz", r.sr));
+    }
+    // 位深读得出且低于 16bit 才判不合格; 读不出的(某些容器不写)只在下面记备注。
+    if let Some(b) = r.bits {
+        if b < MIN_BITS {
+            fails.push(format!("采样位深{b}位, 低于16位"));
+        }
     }
 
     // 4. 时长与静音比例
@@ -352,8 +368,9 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
     if r.side_ratio.is_some_and(|v| v < DUAL_MONO_SIDE) {
         notes.push("左右声道完全一样, 实际听不出立体声".into());
     }
-    if r.bits.is_some_and(|b| b < 16) {
-        notes.push(format!("位深只有{}位", r.bits.unwrap_or(0)));
+    // 响度偏低: 只提示, 不判不合格(交付方要求 -40dB 以上, 但不作退货依据)
+    if r.loudness.is_some_and(|v| v < MIN_LOUDNESS_DB) {
+        notes.push(format!("响度只有{:.1}dB, 偏小声(要求-40dB以上, 不作退货依据)", r.loudness.unwrap()));
     }
 
     // 测不出来的项要说一声, 否则空白列会被当成"通过了"
@@ -362,6 +379,12 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
     }
     if r.cutoff.is_none() {
         notes.push("频响测不出: 内容太短或几乎无声".into());
+    }
+    if r.bits.is_none() {
+        notes.push("采样位深读不出: 需人工确认是否16位以上".into());
+    }
+    if r.loudness.is_none() {
+        notes.push("响度测不出: 全程几乎没有信号".into());
     }
     // 信噪比不合格时补一个底噪数字: 只看 SNR 分不清是"底噪吵"还是"录得太小声"
     if let (Some(v), Some(n)) = (r.snr, r.noise) {
@@ -387,9 +410,11 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
         fmt_stereo(&r),
         r.channels.to_string(),
         r.sr.to_string(),
+        fmt_bits(&r),
         mmss(r.dur),
         format!("{:.1}%", r.silence * 100.0),
         fmt_opt(r.snr, 1),
+        fmt_opt(r.loudness, 1),
         fmt_band(&r),
         if fails.is_empty() { "是".into() } else { format!("否：{}", fails.join("；")) },
         notes.join("；"),
@@ -397,13 +422,14 @@ pub fn check_file(path: &Path, root: Option<&Path>, cfg: &Settings) -> Vec<Strin
 }
 
 /// 「文件类型」一列要同时回答第 1 条(必须是 WAV)和第 6 条(未压缩), 所以容器和
-/// 编码都写进去: "WAV/pcm_s16le 16bit"。位深附在后面, 不单独占一列。
+/// 编码都写进去: "WAV/pcm_s16le"。位深现在单独占「采样位深」一列, 这里不再重复。
 fn fmt_file_type(r: &Raw) -> String {
-    let mut t = format!("{}/{}", r.container, r.codec);
-    if let Some(b) = r.bits {
-        t.push_str(&format!(" {b}bit"));
-    }
-    t
+    format!("{}/{}", r.container, r.codec)
+}
+
+/// 「采样位深」一列。读不出就留空, 判定那边会补一句备注。
+fn fmt_bits(r: &Raw) -> String {
+    r.bits.map(|b| format!("{b}bit")).unwrap_or_default()
 }
 
 /// 「是否立体声」。双单声道声道数确实是 2, 判定上不算不合格(见备注), 但这一列
@@ -520,6 +546,31 @@ mod tests {
         std::fs::File::create(path).unwrap().write_all(&b).unwrap();
     }
 
+    /// 写一个 8bit PCM WAV(无符号, 128 为零点)。只给采样位深判定用。
+    pub fn write_wav_8bit(path: &Path, sr: u32, ch: u16, frames: &[Vec<f64>]) {
+        use std::io::Write;
+        let data_len = frames.len() * ch as usize;
+        let mut b: Vec<u8> = Vec::with_capacity(44 + data_len);
+        b.extend(b"RIFF");
+        b.extend(((36 + data_len) as u32).to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes());
+        b.extend(1u16.to_le_bytes());                       // PCM
+        b.extend(ch.to_le_bytes());
+        b.extend(sr.to_le_bytes());
+        b.extend((sr * ch as u32).to_le_bytes());            // 字节率
+        b.extend(ch.to_le_bytes());                          // 块对齐
+        b.extend(8u16.to_le_bytes());                        // 位深
+        b.extend(b"data");
+        b.extend((data_len as u32).to_le_bytes());
+        for fr in frames {
+            for v in fr {
+                b.push(((v.clamp(-1.0, 1.0) * 127.0) as i16 + 128) as u8);
+            }
+        }
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
     /// 3.3 秒有内容 + 0.7 秒仅本底噪声的立体声轨。左右给不同相位, 是真立体声。
     ///
     /// 本底幅度必须大于 16bit 的 1 个 LSB(1/32767 = 3.05e-5), 否则量化之后整段
@@ -583,13 +634,16 @@ mod tests {
         // 交付方指定的那几列要填对
         let col = |n: &str| row[COLUMNS.iter().position(|c| *c == n).unwrap()].clone();
         assert!(col("文件类型").starts_with("WAV/"), "{}", col("文件类型"));
-        assert!(col("文件类型").ends_with("16bit"), "{}", col("文件类型"));
+        assert_eq!(col("采样位深"), "16bit", "{}", col("采样位深"));
         assert_eq!(col("是否立体声"), "是");
         assert_eq!(col("声道数"), "2");
         assert_eq!(col("采样率"), "44100");
         assert_eq!(col("时长"), "0:04");
         assert!(col("静音比例").ends_with('%'), "{}", col("静音比例"));
         assert!(col("频响").ends_with("kHz"), "{}", col("频响"));
+        // 响度是活动段 RMS, 0.3 幅值的正弦大约 -13dB, 稳稳在 -40dB 门限之上
+        assert!(!col("响度dB").is_empty(), "响度应该测得出");
+        assert!(r.loudness.unwrap() > MIN_LOUDNESS_DB, "loudness={:?}", r.loudness);
 
         // 备注可读性护栏: 一条各项达标的文件, 备注里只该剩"±3dB 没验"这一句,
         // 不该再挂方法论长文, 也不该出现行话。这一列曾经被这两样挤垮过。
@@ -646,6 +700,39 @@ mod tests {
         let row = check_file(&f.0, None, &cfg);
         assert!(row[VERDICT_COL].contains("采样率"), "{}", row[VERDICT_COL]);
         assert!(row[VERDICT_COL].contains("20kHz"), "{}", row[VERDICT_COL]);
+    }
+
+    /// 8bit PCM: 采样位深不合格(第 3 条要求 16bit 以上), 且要判"否"。
+    #[test]
+    fn low_bit_depth_fails() {
+        let f = tmp("lowbits");
+        write_wav_8bit(&f.0, 44100, 2, &stereo_take(44100, false));
+        let cfg = Settings { min_dur_s: 1.0, ..Default::default() };
+        let r = analyse(&f.0, &cfg).unwrap();
+        assert_eq!(r.bits, Some(8), "bits={:?}", r.bits);
+        let row = check_file(&f.0, None, &cfg);
+        assert!(row[VERDICT_COL].starts_with("否"), "{}", row[VERDICT_COL]);
+        assert!(row[VERDICT_COL].contains("采样位深"), "{}", row[VERDICT_COL]);
+        assert_eq!(row[COLUMNS.iter().position(|c| *c == "采样位深").unwrap()], "8bit");
+    }
+
+    /// 响度低于 -40dB 只进备注, 不影响"是否满足要求"。
+    #[test]
+    fn quiet_take_flagged_but_not_failed() {
+        let f = tmp("quiet");
+        // stereo_take 的信号幅度 0.3, 缩到 0.002 → 活动段 RMS 约 -55dBFS
+        let frames: Vec<Vec<f64>> = stereo_take(44100, false)
+            .into_iter()
+            .map(|fr| fr.into_iter().map(|v| v * 0.006).collect())
+            .collect();
+        write_wav(&f.0, 44100, 2, &frames);
+        let cfg = Settings { min_dur_s: 1.0, ..Default::default() };
+        let r = analyse(&f.0, &cfg).unwrap();
+        let row = check_file(&f.0, None, &cfg);
+        if r.loudness.is_some_and(|v| v < MIN_LOUDNESS_DB) {
+            assert!(row[NOTES_COL].contains("响度"), "备注应提响度: {}", row[NOTES_COL]);
+            assert!(!row[VERDICT_COL].contains("响度"), "响度不该进不合格: {}", row[VERDICT_COL]);
+        }
     }
 
     #[test]

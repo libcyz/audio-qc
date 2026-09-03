@@ -6,10 +6,18 @@ name: build-raw
 #   - 版本标签用 raw-v* 前缀, 不跟项目A 的 v* 抢
 #   - Release 挂在 raw-latest / raw-vX.Y 上, 不会覆盖项目A 的 latest
 #   - 只编 -p audio_qc_raw, 项目A 的产物不进这条流水线
+#
+# paths-ignore: 只改了项目A 独有的东西(build.yml、Info.plist)时不跑这条 —— 但
+# audio_qc_raw 用了 audio_qc 这个库, 所以改 src/ 或根 Cargo.lock 仍然会跑。
+# workflow_dispatch 手动触发不受 paths-ignore 限制。
 on:
   push:
     branches: [main]
     tags: ["raw-v*"]
+    paths-ignore:
+      - ".github/workflows/build.yml"
+      - "packaging/Info.plist"
+      - "README.md"
   workflow_dispatch:
 
 env:

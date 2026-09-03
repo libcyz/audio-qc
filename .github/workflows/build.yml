@@ -2,10 +2,19 @@ name: build
 
 # 手动点一下、推 main、或者打 v* 标签, 都会出包。
 # macOS 那台是苹果自己的云端机器, 所以不需要你有 Mac。
+#
+# paths-ignore: 只改了项目B(audio_qc_raw)自己的东西时不跑这条流水线 —— 项目A
+# 的源码在 src/, 不依赖 crates/ 里的任何东西。改 src/ 或根 Cargo.lock 仍然会跑
+# (那些是两个项目共用的)。workflow_dispatch 手动触发不受 paths-ignore 限制。
 on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - "crates/audio_qc_raw/**"
+      - ".github/workflows/build-raw.yml"
+      - "packaging/Info-Raw.plist"
+      - "README.md"
   workflow_dispatch:
 
 env:
