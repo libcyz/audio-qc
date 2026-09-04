@@ -868,12 +868,11 @@ fn fmt_opt(v: Option<f64>, n: usize) -> String {
     }
 }
 
-/// 时长写成 mm:ss.mmm。取整到秒会把"两条轨差了几十毫秒"这种对轨问题抹平, 所以
-/// 精确到毫秒 —— 时长本身是 采样数/采样率 算出来的, 毫秒位是真实数字不是凑的。
-fn mmss(s: f64) -> String {
-    // 先整体四舍五入到毫秒再拆分, 免得 59.9996 秒被拆成 "00:59.1000"
-    let ms = (s * 1000.0).round().max(0.0) as i64;
-    format!("{:02}:{:02}.{:03}", ms / 60_000, ms / 1000 % 60, ms % 1000)
+/// 时长直接写毫秒整数(230000 就是 230 秒)。原来是 mm:ss, 那种写法在 Excel 里
+/// 是一串文本, 既不能排序也不能相减; 要的就是能直接拿来比对的数字。
+/// 时长本身是 采样数/采样率 算出来的, 毫秒位是真实数字不是凑的。
+fn dur_ms(s: f64) -> String {
+    format!("{}", (s * 1000.0).round().max(0.0) as i64)
 }
 
 /// 活动比例那两列: 有数字就写百分比, 没有就按角色写明原因(见 activity_placeholder)
@@ -974,7 +973,8 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
         song_notes.push(format!("无{}", miss.join("和")));
     }
 
-    let mut rows = Vec::new();
+    // 每个文件先各算各的; 整首歌的判定要等所有文件都算完才知道(见 apply_group_verdict)
+    let mut drafts: Vec<Draft> = Vec::new();
     for ((role, res), (path, _)) in tracks.iter().zip(&group.files) {
         let name = match root {
             Some(r) => path.strip_prefix(r).unwrap_or(path).to_string_lossy().to_string(),
@@ -986,14 +986,16 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             .unwrap_or("")
             .to_ascii_uppercase();
 
+        // 点名用短文件名: 相对路径太长, 挤在"是否满足要求"里看不清
+        let short = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
         let t = match res {
             Err(e) => {
-                // 单个文件坏掉不影响同一首歌的其他文件
-                let mut row = vec![String::new(); COLUMNS.len()];
-                row[0] = name;
-                row[1] = ext;
-                row[VERDICT_COL] = format!("否：{e}");
-                rows.push(row);
+                // 单个文件坏掉不耽误同组其他文件出数, 但这首歌整体还是不合格
+                let mut cells = vec![String::new(); COLUMNS.len()];
+                cells[0] = name;
+                cells[1] = ext;
+                drafts.push(Draft { cells, fails: vec![e.clone()], name: short });
                 continue;
             }
             Ok(t) => t,
@@ -1055,11 +1057,11 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             fails.push(format!("检测到削波({}处连续触顶采样)", t.clip_events));
         }
 
-        rows.push(vec![
+        let cells = vec![
             name,
             ext,
             t.sr.to_string(),
-            mmss(t.dur),
+            dur_ms(t.dur),
             format!("{:.0}", t.bitrate),
             fmt_opt(t.noise, 1),
             fmt_opt(t.cutoff.map(|c| c / 1000.0), 2),
@@ -1069,11 +1071,42 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             fmt_opt(t.peak_db, 1),
             format!("{:.1}", t.rms),
             if t.clip_events > 0 { format!("是({}处)", t.clip_events) } else { "否".into() },
-            if fails.is_empty() { "是".into() } else { format!("否：{}", fails.join("；")) },
+            String::new(),    // 判定列等整组汇总完再填
             notes.join("；"),
-        ]);
+        ];
+        drafts.push(Draft { cells, fails, name: short });
     }
-    rows
+
+    apply_group_verdict(&mut drafts);
+    drafts.into_iter().map(|d| d.cells).collect()
+}
+
+/// check_song 的中间态: 一行的单元格 + 这个文件自己的不合格原因 + 点名用的文件名。
+struct Draft {
+    cells: Vec<String>,
+    fails: Vec<String>,
+    name: String,
+}
+
+/// 填"是否满足要求"这一列。一首歌是一个交付单元 —— 人声、伴奏、合轨要一起返工,
+/// 所以组里只要有一个文件不合格, 这首歌的每一行都判"否"。
+/// 自己没毛病的那几行写清楚是被哪个文件带下来的, 否则看表的人对着一行全绿的数字
+/// 会以为判错了, 也不知道该去修哪个文件。
+fn apply_group_verdict(drafts: &mut [Draft]) {
+    let bad: Vec<String> = drafts
+        .iter()
+        .filter(|d| !d.fails.is_empty())
+        .map(|d| d.name.clone())
+        .collect();
+    for d in drafts.iter_mut() {
+        d.cells[VERDICT_COL] = if !d.fails.is_empty() {
+            format!("否：{}", d.fails.join("；"))
+        } else if !bad.is_empty() {
+            format!("否：同组{}不合格", bad.join("、"))
+        } else {
+            "是".into()
+        };
+    }
 }
 
 // ============================================================ 自检
@@ -1081,13 +1114,46 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
 mod tests {
     use super::*;
 
-    /// 时长精确到毫秒, 且进位不能跨错位: 59.9996 秒是 01:00.000, 不是 00:59.1000。
+    /// 时长是毫秒整数, 不是 mm:ss —— 这一列要能在 Excel 里直接排序相减。
     #[test]
-    fn duration_is_millisecond_precise() {
-        assert_eq!(mmss(0.0), "00:00.000");
-        assert_eq!(mmss(225.4134), "03:45.413");
-        assert_eq!(mmss(59.9996), "01:00.000");
-        assert_eq!(mmss(3600.5), "60:00.500");
+    fn duration_is_plain_milliseconds() {
+        assert_eq!(dur_ms(0.0), "0");
+        assert_eq!(dur_ms(230.0), "230000");
+        assert_eq!(dur_ms(225.4134), "225413");
+        assert_eq!(dur_ms(59.9996), "60000");
+    }
+
+    /// 一首歌里有一个文件不合格, 同组每一行都得判"否", 并写明是被谁带下来的。
+    #[test]
+    fn one_bad_file_fails_the_whole_song() {
+        let draft = |name: &str, fails: Vec<String>| Draft {
+            cells: vec![String::new(); COLUMNS.len()],
+            fails,
+            name: name.into(),
+        };
+        let mut d = vec![
+            draft("a_voc.wav", vec!["码率200kbps<320".into()]),
+            draft("a_inst.wav", vec![]),
+            draft("a_vocandinst.wav", vec![]),
+        ];
+        apply_group_verdict(&mut d);
+        assert_eq!(d[0].cells[VERDICT_COL], "否：码率200kbps<320");
+        assert_eq!(d[1].cells[VERDICT_COL], "否：同组a_voc.wav不合格");
+        assert_eq!(d[2].cells[VERDICT_COL], "否：同组a_voc.wav不合格");
+
+        // 全组都没问题才写"是"
+        let mut ok = vec![draft("b_voc.wav", vec![]), draft("b_inst.wav", vec![])];
+        apply_group_verdict(&mut ok);
+        assert!(ok.iter().all(|d| d.cells[VERDICT_COL] == "是"));
+
+        // 多个文件出问题时, 合格的那行要把它们都点出来
+        let mut two = vec![
+            draft("c_voc.wav", vec!["削波".into()]),
+            draft("c_inst.wav", vec!["底噪-30dBFS高于-40".into()]),
+            draft("c_vocandinst.wav", vec![]),
+        ];
+        apply_group_verdict(&mut two);
+        assert_eq!(two[2].cells[VERDICT_COL], "否：同组c_voc.wav、c_inst.wav不合格");
     }
 
     /// is_pcm_codec 靠 symphonia 的编号区间判断, 升级依赖后编号一旦挪动
