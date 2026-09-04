@@ -868,9 +868,12 @@ fn fmt_opt(v: Option<f64>, n: usize) -> String {
     }
 }
 
+/// 时长写成 mm:ss.mmm。取整到秒会把"两条轨差了几十毫秒"这种对轨问题抹平, 所以
+/// 精确到毫秒 —— 时长本身是 采样数/采样率 算出来的, 毫秒位是真实数字不是凑的。
 fn mmss(s: f64) -> String {
-    let t = s.round() as i64;
-    format!("{:02}:{:02}", t / 60, t % 60)
+    // 先整体四舍五入到毫秒再拆分, 免得 59.9996 秒被拆成 "00:59.1000"
+    let ms = (s * 1000.0).round().max(0.0) as i64;
+    format!("{:02}:{:02}.{:03}", ms / 60_000, ms / 1000 % 60, ms % 1000)
 }
 
 /// 活动比例那两列: 有数字就写百分比, 没有就按角色写明原因(见 activity_placeholder)
@@ -1077,6 +1080,15 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 时长精确到毫秒, 且进位不能跨错位: 59.9996 秒是 01:00.000, 不是 00:59.1000。
+    #[test]
+    fn duration_is_millisecond_precise() {
+        assert_eq!(mmss(0.0), "00:00.000");
+        assert_eq!(mmss(225.4134), "03:45.413");
+        assert_eq!(mmss(59.9996), "01:00.000");
+        assert_eq!(mmss(3600.5), "60:00.500");
+    }
 
     /// is_pcm_codec 靠 symphonia 的编号区间判断, 升级依赖后编号一旦挪动
     /// 这里会当场失败 —— 别改成"跟着新编号调区间"就完事, 要确认 A-law/μ-law
