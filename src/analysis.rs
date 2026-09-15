@@ -27,11 +27,12 @@ pub const RMS_DIFF_LO: f64 = -15.0;      // 人声-伴奏 平均RMS差 dB, 下�
 pub const RMS_DIFF_HI: f64 = 10.0;       // 上限
 pub const CUTOFF_HZ: f64 = 15000.0;      // 截止频率 >=
 pub const BITRATE_KBPS: f64 = 320.0;     // 码率 >=
-pub const NOISE_DBFS: f64 = -40.0;       // 底噪 <
+pub const VOC_NOISE_DBFS: f64 = -40.0;   // 人声底噪 < , 界面可改
+pub const INS_NOISE_DBFS: f64 = -40.0;   // 伴奏及合轨底噪 < , 界面可改
 pub const RT60_S: f64 = 0.30;            // RT60 <
 pub const PEAK_DB_MAX: f64 = -1.0;       // 峰值电平: 不超过这个值(没有下限)
-pub const AVG_DB_LO: f64 = -26.0;        // 平均幅值(活动段 RMS): 下限, 界面可改
-pub const AVG_DB_HI: f64 = -3.0;         // 上限, 界面可改
+pub const AVG_DB_LO: f64 = -26.0;        // 平均幅值(活动段 RMS): 下限, 界面可改; 伴奏不卡
+pub const AVG_DB_HI: f64 = -3.0;         // 上限, 界面可改; 伴奏不卡
 
 // ---- 界面可调参数 -----------------------------------------------------------
 /// 平均幅值统计"活动段"的方式。活动比例和底噪不受这个开关影响 —— 那两项按
@@ -52,11 +53,21 @@ pub struct Settings {
     pub avg_mode: AvgMode,
     pub avg_db_lo: f64,
     pub avg_db_hi: f64,
+    /// 人声轨底噪上限 (dBFS)。测得的静音段平均电平必须低于此值。
+    pub voc_noise_db: f64,
+    /// 伴奏轨和合轨底噪上限 (dBFS)。合轨跟伴奏走同一条, 比人声更松。
+    pub ins_noise_db: f64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { avg_mode: AvgMode::Vad(1), avg_db_lo: AVG_DB_LO, avg_db_hi: AVG_DB_HI }
+        Self {
+            avg_mode: AvgMode::Vad(1),
+            avg_db_lo: AVG_DB_LO,
+            avg_db_hi: AVG_DB_HI,
+            voc_noise_db: VOC_NOISE_DBFS,
+            ins_noise_db: INS_NOISE_DBFS,
+        }
     }
 }
 
@@ -906,6 +917,19 @@ fn activity_placeholder(role: Role, voc_col: bool) -> &'static str {
     }
 }
 
+/// 底噪上限按角色走两套: 人声一条, 伴奏和合轨共用另一条。
+fn noise_limit_db(role: Role, cfg: &Settings) -> f64 {
+    match role {
+        Role::Voc => cfg.voc_noise_db,
+        Role::Ins | Role::Mix => cfg.ins_noise_db,
+    }
+}
+
+/// 平均幅值只卡人声和合轨。伴奏轨不判 —— 伴奏响度跨度大, 卡幅值会误杀正常垫底。
+fn checks_avg_db(role: Role) -> bool {
+    !matches!(role, Role::Ins)
+}
+
 /// 校验一首歌, 每个音频出一行。root 用于把文件名显示成相对路径。
 pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec<Vec<String>> {
     let mut tracks: Vec<(Role, Result<Track, String>)> = Vec::new();
@@ -1030,9 +1054,12 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             }
             Some(_) => {}
         }
+        let noise_lim = noise_limit_db(*role, cfg);
         match t.noise {
             None => notes.push("底噪未测(无静音段)".into()),
-            Some(nf) if nf >= NOISE_DBFS => fails.push(format!("底噪{nf:.1}dBFS高于-40")),
+            Some(nf) if nf >= noise_lim => {
+                fails.push(format!("底噪{nf:.1}dBFS高于{noise_lim}"))
+            }
             Some(_) => {}
         }
         match t.peak_db {
@@ -1044,7 +1071,8 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
         }
         // 平均幅值 = 活动段 RMS(t.rms), 跟峰值电平是两回事: 峰值管"顶没顶到头",
         // 平均幅值管"整体响不响"——同一个峰值下, 平均幅值越高说明动态压得越死。
-        if !(cfg.avg_db_lo..=cfg.avg_db_hi).contains(&t.rms) {
+        // 伴奏轨不卡这项, 只写数字给人看。
+        if checks_avg_db(*role) && !(cfg.avg_db_lo..=cfg.avg_db_hi).contains(&t.rms) {
             fails.push(format!(
                 "平均幅值{:.1}dBFS超出[{},{}]",
                 t.rms, cfg.avg_db_lo, cfg.avg_db_hi
@@ -1445,5 +1473,27 @@ mod tests {
         let g = group_audio(&files);
         assert_eq!(g.len(), 1, "5个同曲文件应分到同一组");
         assert_eq!(g[0].files.len(), 5);
+    }
+
+    /// 底噪两套上限、平均幅值只卡人声/合轨 —— 这是这次按角色拆开判定的契约。
+    #[test]
+    fn noise_and_avg_rules_depend_on_role() {
+        let cfg = Settings {
+            voc_noise_db: -50.0,
+            ins_noise_db: -40.0,
+            ..Default::default()
+        };
+        assert_eq!(noise_limit_db(Role::Voc, &cfg), -50.0);
+        assert_eq!(noise_limit_db(Role::Ins, &cfg), -40.0);
+        assert_eq!(noise_limit_db(Role::Mix, &cfg), -40.0, "合轨跟伴奏走同一条底噪上限");
+        assert!(checks_avg_db(Role::Voc));
+        assert!(!checks_avg_db(Role::Ins), "伴奏不卡平均幅值");
+        assert!(checks_avg_db(Role::Mix), "合轨仍卡平均幅值");
+
+        let def = Settings::default();
+        assert_eq!(def.voc_noise_db, VOC_NOISE_DBFS);
+        assert_eq!(def.ins_noise_db, INS_NOISE_DBFS);
+        assert_eq!(def.voc_noise_db, -40.0);
+        assert_eq!(def.ins_noise_db, -40.0);
     }
 }

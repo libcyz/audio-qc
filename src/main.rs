@@ -323,7 +323,7 @@ impl eframe::App for App {
                 });
             });
 
-            // 平均幅值的两个可调项。校验途中不让改, 免得同一批结果用了两套参数。
+            // 可调项。校验途中不让改, 免得同一批结果用了两套参数。
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.busy, |ui| {
@@ -352,23 +352,53 @@ impl eframe::App for App {
                         );
 
                     ui.add_space(12.0);
-                    ui.label("合格范围");
+                    ui.label("合格范围(人声/合轨)");
                     ui.add(
                         egui::DragValue::new(&mut self.cfg.avg_db_lo)
                             .speed(0.5)
                             .range(-60.0..=0.0)
                             .suffix(" dBFS"),
-                    );
+                    )
+                    .on_hover_text("只卡人声轨和合轨。伴奏轨不判平均幅值。");
                     ui.label("～");
                     ui.add(
                         egui::DragValue::new(&mut self.cfg.avg_db_hi)
                             .speed(0.5)
                             .range(-60.0..=0.0)
                             .suffix(" dBFS"),
-                    );
+                    )
+                    .on_hover_text("只卡人声轨和合轨。伴奏轨不判平均幅值。");
                     if ui.button("恢复默认").clicked() {
                         self.cfg = analysis::Settings::default();
                     }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    ui.label("人声底噪上限");
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.voc_noise_db)
+                            .speed(0.5)
+                            .range(-90.0..=0.0)
+                            .suffix(" dBFS"),
+                    )
+                    .on_hover_text(
+                        "人声轨(voc / vocselfacc)静音段平均电平必须低于此值。\n\
+                         测不出底噪(没有静音段)只记备注, 不判不合格。",
+                    );
+
+                    ui.add_space(12.0);
+                    ui.label("伴奏/合轨底噪上限");
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.ins_noise_db)
+                            .speed(0.5)
+                            .range(-90.0..=0.0)
+                            .suffix(" dBFS"),
+                    )
+                    .on_hover_text(
+                        "伴奏轨和合轨(vocandinst / vocselfaccandinst)共用这条。\n\
+                         默认 −40 dBFS。测不出底噪只记备注, 不判不合格。",
+                    );
                 });
             });
 
