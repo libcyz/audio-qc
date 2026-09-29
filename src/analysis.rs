@@ -6,7 +6,7 @@ use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
 
 // ---- CSV 表头 (交付方规定, 顺序不要动) --------------------------------------
-pub const COLUMNS: [&str; 15] = [
+pub const COLUMNS: [&str; 16] = [
     "文件名",
     "格式",
     "采样率",
@@ -20,6 +20,7 @@ pub const COLUMNS: [&str; 15] = [
     "峰值电平",
     "平均幅值",
     "是否削波",
+    "RT60",
     "是否满足要求",
     "备注（如有）",
 ];
@@ -851,11 +852,10 @@ fn checks_avg_db(role: Role) -> bool {
     !matches!(role, Role::Ins)
 }
 
-/// 每条轨各自记 RT60、各自卡 0.3s。测不出只备注。计算仍走 rt60()。
-fn apply_rt60(rt: Option<&Rt60>, fails: &mut Vec<String>, notes: &mut Vec<String>) {
+/// 每条轨各自卡 0.3s。返回 RT60 列要写的数(秒, 两位小数); 测不出留空, 不进备注。
+fn apply_rt60(rt: Option<&Rt60>, fails: &mut Vec<String>) -> String {
     match rt {
         Some(v) => {
-            notes.push(format!("RT60 {:.2}s(混响时间)", v.median));
             if v.median >= RT60_S {
                 let weak = if v.is_thin() {
                     format!("(仅{}段, 建议复核)", v.segments)
@@ -864,8 +864,9 @@ fn apply_rt60(rt: Option<&Rt60>, fails: &mut Vec<String>, notes: &mut Vec<String
                 };
                 fails.push(format!("混响时间RT60={:.2}s>=0.3s{weak}", v.median));
             }
+            format!("{:.2}", v.median)
         }
-        None => notes.push("RT60未测出(混响时间)".into()),
+        None => String::new(),
     }
 }
 
@@ -1005,7 +1006,7 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
         if t.clip_events > 0 {
             fails.push(format!("检测到削波({}处连续触顶采样)", t.clip_events));
         }
-        apply_rt60(t.rt60.as_ref(), &mut fails, &mut notes);
+        let rt60_cell = apply_rt60(t.rt60.as_ref(), &mut fails);
 
         let cells = vec![
             name,
@@ -1025,6 +1026,7 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             } else {
                 "否".into()
             },
+            rt60_cell,
             String::new(), // 判定列等整组汇总完再填
             notes.join("；"),
         ];
@@ -1419,28 +1421,30 @@ mod tests {
 
     #[test]
     fn rt60_judged_per_track() {
+        assert_eq!(COLUMNS[COLUMNS.len() - 3], "RT60");
+        assert_eq!(COLUMNS[VERDICT_COL], "是否满足要求");
+
         let mut fails = Vec::new();
-        let mut notes = Vec::new();
-        apply_rt60(None, &mut fails, &mut notes);
+        assert_eq!(apply_rt60(None, &mut fails), "");
         assert!(fails.is_empty(), "测不出不判不合格");
-        assert!(notes.iter().any(|n| n.contains("未测出")));
 
         fails.clear();
-        notes.clear();
-        apply_rt60(
-            Some(&Rt60 { median: 0.20, segments: 20, over_limit: 0 }),
-            &mut fails,
-            &mut notes,
+        assert_eq!(
+            apply_rt60(
+                Some(&Rt60 { median: 0.20, segments: 20, over_limit: 0 }),
+                &mut fails,
+            ),
+            "0.20"
         );
         assert!(fails.is_empty());
-        assert!(notes.iter().any(|n| n.contains("0.20")));
 
         fails.clear();
-        notes.clear();
-        apply_rt60(
-            Some(&Rt60 { median: 0.40, segments: 20, over_limit: 1 }),
-            &mut fails,
-            &mut notes,
+        assert_eq!(
+            apply_rt60(
+                Some(&Rt60 { median: 0.40, segments: 20, over_limit: 1 }),
+                &mut fails,
+            ),
+            "0.40"
         );
         assert!(fails.iter().any(|f| f.contains(">=0.3s")));
     }
