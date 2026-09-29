@@ -1,62 +1,62 @@
-//! 音频指标计算。判定逻辑集中在这里, 界面只负责调用。
-//!
-//! 与 Python 版 check_audio.py 的差别:
-//!   - 底噪改成"整段音频静音部分的能量平均", 不再用分位数, 也不再只在人声轨判定
-//!   - 不校验 meta json, 只看音频本身
+//! 音频指标与判定。界面只负责调用。
 
 use std::path::{Path, PathBuf};
 
-use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
+use rustfft::num_complex::Complex;
 
 // ---- CSV 表头 (交付方规定, 顺序不要动) --------------------------------------
 pub const COLUMNS: [&str; 15] = [
-    "文件名", "格式", "采样率", "时长", "码率kbps", "底噪dBFS", "截至频率Khz",
-    "人声活动比例", "伴奏活动比例", "人声伴奏分贝差", "峰值电平", "平均幅值", "是否削波",
-    "是否满足要求", "备注（如有）",
+    "文件名",
+    "格式",
+    "采样率",
+    "时长",
+    "码率kbps",
+    "底噪dBFS",
+    "截至频率Khz",
+    "人声活动比例",
+    "伴奏活动比例",
+    "人声伴奏分贝差",
+    "峰值电平",
+    "平均幅值",
+    "是否削波",
+    "是否满足要求",
+    "备注（如有）",
 ];
-// "是否满足要求"/"备注" 永远是最后两列, 用相对位置算下标 —— 以后再插新列
-// 不用满仓库找哪里写死了 10/11, 那正是这次踩过的坑。
+
 pub const VERDICT_COL: usize = COLUMNS.len() - 2;
 pub const NOTES_COL: usize = COLUMNS.len() - 1;
 
-// ---- 判定阈值 (需要标定时改这里) --------------------------------------------
-pub const INS_ACTIVITY: f64 = 0.80;      // 伴奏活动比例 >=
-pub const VOC_ACTIVITY: f64 = 0.40;      // 人声活动比例 >=
-pub const RMS_DIFF_LO: f64 = -15.0;      // 人声-伴奏 平均RMS差 dB, 下限
-pub const RMS_DIFF_HI: f64 = 10.0;       // 上限
-pub const CUTOFF_HZ: f64 = 15000.0;      // 截止频率 >=
-pub const BITRATE_KBPS: f64 = 320.0;     // 码率 >=
-pub const VOC_NOISE_DBFS: f64 = -40.0;   // 人声底噪 < , 界面可改
-pub const INS_NOISE_DBFS: f64 = -40.0;   // 伴奏及合轨底噪 < , 界面可改
-pub const RT60_S: f64 = 0.30;            // RT60 <
-pub const PEAK_DB_MAX: f64 = -1.0;       // 峰值电平: 不超过这个值(没有下限)
-pub const AVG_DB_LO: f64 = -26.0;        // 平均幅值(活动段 RMS): 下限, 界面可改; 伴奏不卡
-pub const AVG_DB_HI: f64 = -3.0;         // 上限, 界面可改; 伴奏不卡
+pub const INS_ACTIVITY: f64 = 0.80; // 伴奏活动比例 >=
+pub const VOC_ACTIVITY: f64 = 0.40; // 人声活动比例 >=
+pub const RMS_DIFF_LO: f64 = -15.0; // 人声-伴奏 平均RMS差 dB, 下限
+pub const RMS_DIFF_HI: f64 = 10.0; // 上限
+pub const CUTOFF_HZ: f64 = 15000.0; // 截止频率 >=
+pub const BITRATE_KBPS: f64 = 320.0; // 码率 >=
+pub const VOC_NOISE_DBFS: f64 = -40.0; // 人声底噪 < , 界面可改
+pub const INS_NOISE_DBFS: f64 = -40.0; // 伴奏及合轨底噪 < , 界面可改
+pub const RT60_S: f64 = 0.30; // RT60 <
+pub const PEAK_DB_MAX: f64 = -1.0; // 峰值上限, 无下限
+pub const AVG_DB_LO: f64 = -26.0; // 平均幅值下限; 伴奏不卡
+pub const AVG_DB_HI: f64 = -3.0; // 平均幅值上限; 伴奏不卡
 
 // ---- 界面可调参数 -----------------------------------------------------------
-/// 平均幅值统计"活动段"的方式。活动比例和底噪不受这个开关影响 —— 那两项按
-/// "活动时长/整歌时长"定义, 一直用能量阈值算, 换成语音检测反而会漏掉伴奏。
+/// 只影响平均幅值的活动段。活动比例和底噪始终用能量阈值。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AvgMode {
-    /// 能量阈值: 高于本轨 P95 电平 -35dB。项目里一直在用的那套。
+    /// 高于本轨 P95-35dB。
     Energy,
-    /// WebRTC VAD, 0~3 是激进程度(越大越严, 判成人声的帧越少)。
-    /// 注意它本来是给语音设计的, 对纯伴奏轨会大面积判成"无人声",
-    /// 这种情况下自动退回能量阈值, 免得平均幅值算不出来。
+    /// WebRTC VAD, 0~3 越大越严。活动帧过少时退回能量阈值。
     Vad(u8),
 }
 
-/// 界面上能改的参数。其余阈值仍写死成常量 —— 只把真正需要现场标定的放出来。
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub avg_mode: AvgMode,
     pub avg_db_lo: f64,
     pub avg_db_hi: f64,
-    /// 人声轨底噪上限 (dBFS)。测得的静音段平均电平必须低于此值。
-    pub voc_noise_db: f64,
-    /// 伴奏轨和合轨底噪上限 (dBFS)。合轨跟伴奏走同一条, 比人声更松。
-    pub ins_noise_db: f64,
+    pub voc_noise_db: f64, // 人声底噪上限
+    pub ins_noise_db: f64, // 伴奏/合轨底噪上限
 }
 
 impl Default for Settings {
@@ -71,47 +71,32 @@ impl Default for Settings {
     }
 }
 
-const VAD_SR: u32 = 16000;               // WebRTC VAD 只收 8k/16k/32k/48k
-const VAD_WIN: f64 = 0.020;              // 只支持 10/20/30ms; 20ms 正好是两个 HOP
-/// VAD 判出的活动帧少于这个比例就认为它"没看懂这条轨"(典型是纯伴奏轨),
-/// 退回能量阈值。不然平均幅值会拿极少数几帧算, 数字没有意义。
-const VAD_MIN_ACTIVE: f64 = 0.05;
-// 削波判定阈值。这里踩过一个坑, 记录一下取舍:
-//
-// 第一版按"贴不贴这个文件自己的峰值"(相对阈值)算, 想解决"削波发生在数字化之前
-// (话筒前级过载), 到 ADC 时还留着几个 dB 余量, 波形已经削平但采样值没到满量程"
-// 这种漏检。结果在真实素材上大批量误报: 任何平滑波峰(不管削没削波)在接近顶点
-// 时导数天然趋近于零, 连续好几个采样贴着"这段波形自己的峰值"是数学必然, 频率
-// 越低(贝斯、鼓)越明显, 跟削波毫无关系。改完之后正常母带(混音轨习惯贴近 0dB
-// 是行业惯例)反而被大量错判, 比如一首正常歌从 0 处误报炸到 4000+ 处。
-//
-// 现在退回绝对阈值, 只是比原来的 0.999(-0.0087dB)略微放宽到 -0.5dB, 给"前级
-// 削波但数字域还有点余量"的常见情况留一点容差。代价是: 如果削波发生得更早、
-// 后面又被大幅降过增益, 峰值远低于 0dB, 这种更极端的情况还是测不出来 —— 两难
-// 之间选了误报率更低的一边。
-const CLIP_THRESHOLD: f64 = 0.9441;      // -0.5dBFS
-const CLIP_MIN_RUN: usize = 3;           // 连续触顶达到这个采样数才算削波; 1~2个可能只是自然的峰值瞬间
+const VAD_SR: u32 = 16000; // WebRTC VAD 只收 8k/16k/32k/48k
+const VAD_WIN: f64 = 0.020; // 只支持 10/20/30ms; 20ms = 两个 HOP
+const VAD_MIN_ACTIVE: f64 = 0.05; // 低于此退回能量阈值
+const CLIP_THRESHOLD: f64 = 0.9441; // -0.5dBFS, 绝对阈值(相对峰值会把圆顶误判成削波)
+const CLIP_MIN_RUN: usize = 3; // 连续触顶才算削波; 1~2 个可能是自然峰值
 
 // ---- 分析参数 ---------------------------------------------------------------
-pub const WIN: f64 = 0.020;                  // 包络分析窗 (秒)
-pub const HOP: f64 = 0.010;                  // 步进 (秒)
-const ACT_REL_DB: f64 = 35.0;            // 活动判定: 高于本轨 P95 电平 - 35 dB
-const ACT_ABS_DBFS: f64 = -55.0;         // 且高于该绝对电平
-pub const SILENCE_DBFS: f64 = -90.0;         // 低于此视为数字静音(剪辑留白), 不算本底噪声
-pub const MIN_SILENCE_S: f64 = 0.5;          // 静音不足这么久就别报底噪了, 样本太少不可信
-const MIN_DURATION_S: f64 = 1.0;         // 短于此的文件没有分析价值
+pub const WIN: f64 = 0.020; // 包络分析窗 (秒)
+pub const HOP: f64 = 0.010; // 步进 (秒)
+const ACT_REL_DB: f64 = 35.0; // 活动判定: 高于本轨 P95 电平 - 35 dB
+const ACT_ABS_DBFS: f64 = -55.0; // 且高于该绝对电平
+pub const SILENCE_DBFS: f64 = -90.0; // 低于此视为剪辑留白, 不算底噪
+pub const MIN_SILENCE_S: f64 = 0.5; // 静音短于此不报底噪
+const MIN_DURATION_S: f64 = 1.0;
 
 pub const CUT_NFFT: usize = 8192;
 const CUT_MAX_FRAMES: usize = 300;
-const CUT_MIN_HZ: f64 = 8000.0;          // 只在 8kHz 以上找"砖墙"
-const CUT_SPAN_HZ: f64 = 1000.0;         // 跌落观察跨度
-const CUT_DROP_DB: f64 = 25.0;           // 跨度内跌落超过该值 = 编码截止
+const CUT_MIN_HZ: f64 = 8000.0; // 只在 8kHz 以上找"砖墙"
+const CUT_SPAN_HZ: f64 = 1000.0; // 跌落观察跨度
+const CUT_DROP_DB: f64 = 25.0; // 跨度内跌落超过该值 = 编码截止
 
-const RT60_HEAD: f64 = 5.0;              // T20 拟合区间: 峰下 5 ~ 25 dB
+const RT60_HEAD: f64 = 5.0; // T20: 峰下 5 ~ 25 dB
 const RT60_TAIL: f64 = 25.0;
-const RT60_MAX_FIT_S: f64 = 0.8;         // 拟合段过长 = 其实是停顿, 不是混响
-const RT60_MIN_R2: f64 = 0.90;           // 拟合优度门槛, 挡掉"衰减穿过停顿"的伪段
-const RT60_MIN_SEGS: usize = 3;          // 有效衰减段少于此数则判定为无法估计
+const RT60_MAX_FIT_S: f64 = 0.8; // 更长多半是停顿
+const RT60_MIN_R2: f64 = 0.90;
+const RT60_MIN_SEGS: usize = 3;
 
 pub const AUDIO_EXT: [&str; 9] = [
     "wav", "mp3", "flac", "m4a", "aac", "ogg", "wma", "aiff", "aif",
@@ -122,29 +107,18 @@ pub struct Decoded {
     pub mono: Vec<f64>,
     pub sr: u32,
     pub channels: usize,
-    /// 原始采样的最大绝对值(下混增益归一之前)。峰值电平必须用这个, 不能用
-    /// `mono` —— mono 为了对齐响度被乘过增益, 拿它算峰值会是缩放过的假峰值。
+    /// 增益归一前的峰值; 峰值电平必须用这个, 不能用 mono。
     pub peak: f64,
-    /// 削波事件数: 某个声道连续 >=CLIP_MIN_RUN 个采样触顶算一次, 不是采样计数
-    /// (否则一段长削波会把数字撑得没有意义)。同理必须用原始采样, 不能用 mono。
+    /// 连续 CLIP_MIN_RUN 个采样触顶算一次, 用原始采样。
     pub clip_events: usize,
-    /// symphonia 认出来的真实编码名, 不是文件后缀。改名的 mp3 在这里现原形。
-    pub codec: &'static str,
-    /// 编码是不是未压缩 PCM。.wav 容器里照样能装 ADPCM / A-law / 甚至 mp3,
-    /// 所以"未压缩"只能看编码, 光看后缀判不出来。
+    pub codec: &'static str, // 真实编码, 不是后缀
     pub is_pcm: bool,
-    /// 每个采样的位深, 容器没写就是 None。
     pub bits: Option<u32>,
-    /// 侧信号 (L-R)/2 的能量占总能量的比例; 不是双声道时为 None。
-    /// 用来识别"双单声道": 声道数是 2 但左右完全相同, 声道数看着合格,
-    /// 实际没有任何立体声信息。真立体声这个值在 0.01~0.3 量级。
+    /// (L-R)/2 能量占比; 非双声道为 None。双单声道接近 0。
     pub side_ratio: Option<f64>,
 }
 
-/// PCM 编码 ID 的连续区间。symphonia 把未压缩 PCM 排在 0x100..=0x123,
-/// 紧跟其后的 A-law/μ-law(0x124/0x125) 是压扩编码, 不算未压缩, 所以区间到
-/// F64BE_PLANAR 为止 —— 下面的单元测试盯着这个边界, 升级 symphonia 后如果
-/// 编号挪了会当场失败。
+/// 未压缩 PCM。区间不含 A-law/μ-law。
 fn is_pcm_codec(id: symphonia::core::codecs::audio::AudioCodecId) -> bool {
     use symphonia::core::codecs::audio::well_known::{
         CODEC_ID_PCM_F64BE_PLANAR, CODEC_ID_PCM_S32LE,
@@ -152,12 +126,10 @@ fn is_pcm_codec(id: symphonia::core::codecs::audio::AudioCodecId) -> bool {
     (CODEC_ID_PCM_S32LE..=CODEC_ID_PCM_F64BE_PLANAR).contains(&id)
 }
 
-/// 解码成单声道 f64。下混按能量归一 —— 直接取平均的话, 左右不相关的立体声轨
-/// 会比单声道轨系统性低读约 3dB, 而人声常是单声道、伴奏常是立体声, 那 3dB 会
-/// 直接算进"人声伴奏分贝差"里。
+/// 解码为单声道。下混按能量归一, 避免立体声比单声道系统性低约 3dB。
 pub fn decode(path: &Path) -> Result<Decoded, String> {
-    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymError;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::{FormatOptions, TrackType};
@@ -172,7 +144,12 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
     }
 
     let mut format = symphonia::default::get_probe()
-        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
         .map_err(|_| "认不出这个音频格式(可能不是音频文件, 或者文件已损坏)".to_string())?;
 
     let track = format
@@ -196,21 +173,21 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
         .map_err(|e| format!("没有对应的解码器({e})"))?;
 
     let mut mono: Vec<f64> = Vec::new();
-    let mut sum_sq_all = 0.0f64;      // 所有声道所有采样的平方和, 用于能量归一
+    let mut sum_sq_all = 0.0f64;
     let mut n_all = 0usize;
-    let mut peak = 0.0f64;             // 原始采样最大绝对值, 增益归一之前记录
+    let mut peak = 0.0f64;
     let mut sr = params.sample_rate.unwrap_or(0);
     let mut channels = params.channels.as_ref().map(|c| c.count()).unwrap_or(1);
     let mut inter: Vec<f32> = Vec::new();
-    let mut clip_run: Vec<usize> = Vec::new();   // 每个声道各自的"当前连续触顶计数"
+    let mut clip_run: Vec<usize> = Vec::new();
     let mut clip_events = 0usize;
-    let mut side_ss = 0.0f64;          // 侧信号 (L-R)/2 的平方和, 只在双声道时累加
+    let mut side_ss = 0.0f64;
 
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break,
-            Err(_) => break,          // 尾部损坏: 用已经解出来的部分, 不整首作废
+            Err(_) => break, // 尾部损坏: 用已解出的部分
         };
         if packet.track_id != track_id {
             continue;
@@ -221,7 +198,7 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
                 sr = spec.rate();
                 channels = spec.channels().count().max(1);
                 if clip_run.len() != channels {
-                    clip_run = vec![0usize; channels];   // 声道数变了(极少见)就重新起算
+                    clip_run = vec![0usize; channels];
                 }
                 inter.clear();
                 buf.copy_to_vec_interleaved(&mut inter);
@@ -244,7 +221,7 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
                     mono.push(s / fr.len() as f64);
                 }
             }
-            Err(SymError::DecodeError(_)) => continue,   // 单帧坏了跳过
+            Err(SymError::DecodeError(_)) => continue,
             Err(_) => break,
         }
     }
@@ -265,13 +242,21 @@ pub fn decode(path: &Path) -> Result<Decoded, String> {
             }
         }
     }
-    // 全零文件(sum_sq_all == 0)没有立体声可言, 报 None 而不是 0/0
     let side_ratio = (channels == 2 && sum_sq_all > 0.0).then(|| side_ss / sum_sq_all);
-    Ok(Decoded { mono, sr, channels, peak, clip_events, codec, is_pcm, bits, side_ratio })
+    Ok(Decoded {
+        mono,
+        sr,
+        channels,
+        peak,
+        clip_events,
+        codec,
+        is_pcm,
+        bits,
+        side_ratio,
+    })
 }
 
-// ============================================================ 指标
-/// 逐帧 RMS 电平 (dBFS)。用平方前缀和算, 避免展开成大矩阵。
+/// 逐帧 RMS (dBFS)。
 pub fn frame_db(x: &[f64], sr: u32) -> Vec<f64> {
     let n = (sr as f64 * WIN) as usize;
     let h = (sr as f64 * HOP) as usize;
@@ -321,22 +306,12 @@ pub fn active_seconds(db: &[f64]) -> f64 {
     db.iter().filter(|&&v| v > thr).count() as f64 * HOP
 }
 
-/// 底噪 = 整段音频静音部分的平均电平(按能量平均)。
-///
-/// 静音部分 = 活动判定门限以下的帧, 但要排除数字静音(剪辑留的绝对零, 不是本底噪声)。
-/// 静音总时长不足 MIN_SILENCE_S 就返回 None —— 连续演奏的轨根本没有静音段可测,
-/// 这时报出来的数字只会是"最安静的乐句", 不是底噪。
+/// 静音段能量平均。静音不足 MIN_SILENCE_S 返回 None。
 pub fn noise_floor_db(db: &[f64]) -> Option<f64> {
     noise_floor_db_above(db, SILENCE_DBFS)
 }
 
-/// 同上, 但"数字静音"的下限可以指定。
-///
-/// 项目A 用 -90dBFS: 音乐母带里低于这个电平的帧就是剪辑挖出来的绝对零, 算进去
-/// 会把底噪拉低成一个假数字。但校验信噪比时这个下限就太高了 —— 要求 SNR>=70dB
-/// 意味着底噪本来就该压到 -90 附近, 拿 -90 去滤等于把最该统计的那批帧全扔掉,
-/// 剩下的都是相对吵的帧, 信噪比会系统性偏低、合格文件被误判。那种场合传一个
-/// 远低于任何真实转换器本底的值(见 crates/audio_qc_raw 的 DIGITAL_ZERO_DBFS)。
+/// 同 noise_floor_db, 数字静音下限可指定(项目 A 信噪比用更低的下限)。
 pub fn noise_floor_db_above(db: &[f64], floor_dbfs: f64) -> Option<f64> {
     if db.is_empty() {
         return None;
@@ -361,17 +336,10 @@ pub fn rms_db(x: &[f64]) -> f64 {
     10.0 * (x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64 + 1e-20).log10()
 }
 
-/// 平均幅值(RMS, dB), 只算活动段的采样。"活动/静音"的判断标准复用
-/// active_threshold(简单的能量阈值 VAD): 跟活动比例、底噪同一套逻辑,
-/// 不然安静的前奏尾奏、句间停顿会被一起摊进整段平均, 拉低读数,
-/// 显得录音比实际更"温"。
-///
-/// db 是调用方已经算好的逐帧包络(frame_db 的结果), 这里复用, 不重复算一遍;
-/// 每个活跃帧只计入 HOP 那部分采样(不是整个 WIN 窗口), 跟 active_seconds 数
-/// 时长的口径保持一致 —— 帧与帧之间有重叠, 按 WIN 算会把重叠区间重复计数。
+/// 活动段 RMS。mask 空或全静音时退回整段。按 HOP 计采样, 避免窗重叠重复计数。
 pub fn active_rms_db(x: &[f64], sr: u32, mask: &[bool]) -> f64 {
     if mask.is_empty() {
-        return rms_db(x);   // 太短测不出包络, 退回整段算
+        return rms_db(x);
     }
     let hop = (sr as f64 * HOP) as usize;
     let mut sum_sq = 0.0f64;
@@ -386,22 +354,17 @@ pub fn active_rms_db(x: &[f64], sr: u32, mask: &[bool]) -> f64 {
         n += e - s;
     }
     if n == 0 {
-        return rms_db(x);   // 极端情况全曲没有一帧判定为活跃, 保险退回整段算
+        return rms_db(x);
     }
     10.0 * (sum_sq / n as f64 + 1e-20).log10()
 }
 
-/// 能量阈值活动掩码, 与 active_seconds / noise_floor_db 同一套判据。
 pub fn energy_mask(db: &[f64]) -> Vec<bool> {
     let thr = active_threshold(db);
     db.iter().map(|&v| v > thr).collect()
 }
 
-/// WebRTC VAD 活动掩码, 长度对齐到 db 的帧数(10ms 一格)。
-///
-/// VAD 只吃 16bit PCM、固定采样率、10/20/30ms 定长帧, 所以先线性重采样到 16k
-/// 再按 20ms 切。一个 VAD 帧刚好盖住两个 HOP, 直接 k/2 映射回去。
-/// 判成人声的帧太少(纯伴奏轨的典型表现)时返回 None, 由调用方退回能量阈值。
+/// WebRTC VAD 掩码, 对齐 10ms 帧。活动过少返回 None。
 fn vad_mask(x: &[f64], sr: u32, mode: u8, frames: usize) -> Option<Vec<bool>> {
     use webrtc_vad::{SampleRate, Vad, VadMode};
 
@@ -410,7 +373,6 @@ fn vad_mask(x: &[f64], sr: u32, mode: u8, frames: usize) -> Option<Vec<bool>> {
     if n < step {
         return None;
     }
-    // 线性重采样并转 i16。VAD 只看频谱形状, 这点插值误差无所谓。
     let pcm: Vec<i16> = (0..n)
         .map(|i| {
             let t = i as f64 * sr as f64 / VAD_SR as f64;
@@ -446,17 +408,16 @@ fn vad_mask(x: &[f64], sr: u32, mode: u8, frames: usize) -> Option<Vec<bool>> {
     (ratio >= VAD_MIN_ACTIVE).then_some(mask)
 }
 
-/// 峰值电平(dBFS) = 20*log10(最大绝对采样值)。真静音(peak=0)时没有意义, 返回 None。
+/// 峰值 dBFS。peak=0 返回 None。
 fn peak_dbfs(peak: f64) -> Option<f64> {
-    if peak > 0.0 { Some(20.0 * peak.log10()) } else { None }
+    if peak > 0.0 {
+        Some(20.0 * peak.log10())
+    } else {
+        None
+    }
 }
 
-/// 单声道的单个采样触顶检测: run 是调用方持有的"该声道当前连续触顶计数",
-/// threshold 是绝对幅度门槛(见 CLIP_THRESHOLD 上面那段注释, 记录了为什么最终
-/// 选了绝对阈值而不是相对这个文件自己峰值算)。连续触顶数刚好达到 CLIP_MIN_RUN
-/// 时返回 true(新增一次削波事件), 之后同一段继续触顶不重复计数。只认"连续
-/// 多个采样顶到满量程附近"这种硬削波; 孤立 1~2 个触顶采样可能只是正常的瞬时
-/// 峰值, 不算削波。
+/// 连续触顶达到 CLIP_MIN_RUN 时记一次削波。
 fn clip_step(run: &mut usize, sample: f64, threshold: f64) -> bool {
     if sample.abs() >= threshold {
         *run += 1;
@@ -467,7 +428,7 @@ fn clip_step(run: &mut usize, sample: f64, threshold: f64) -> bool {
     }
 }
 
-/// 长时平均谱 (dB), 只取有内容的帧, 最多 CUT_MAX_FRAMES 帧。
+/// 长时平均谱, 只取能量高于中位数的帧, 最多 CUT_MAX_FRAMES 帧。
 pub fn ltas_db(x: &[f64]) -> Option<Vec<f64>> {
     let n = CUT_NFFT;
     if x.len() < n * 2 {
@@ -519,7 +480,10 @@ pub fn ltas_db(x: &[f64]) -> Option<Vec<f64>> {
         }
     }
     let cnt = used.len() as f64;
-    let raw: Vec<f64> = psd.iter().map(|p| 10.0 * (p / cnt + 1e-20).log10()).collect();
+    let raw: Vec<f64> = psd
+        .iter()
+        .map(|p| 10.0 * (p / cnt + 1e-20).log10())
+        .collect();
 
     // 9 点滑动平均, 边界按零填充 (与 numpy.convolve(..., 'same') 一致)
     let w = 9usize;
@@ -539,8 +503,8 @@ pub fn ltas_db(x: &[f64]) -> Option<Vec<f64>> {
     Some(smooth)
 }
 
-/// 截止频率 = 8kHz 以上第一处"砖墙"(1kHz 内跌落 >=25dB)的半功率点; 没有砖墙就是满带宽。
-/// 不用"峰值 -X dB"的判法: 干声本身高频就低, 那样会把好文件判成 4kHz。
+/// 8kHz 以上砖墙(1kHz 内跌 ≥25dB)的半功率点; 无砖墙则满带宽。
+/// 不用峰值-X dB: 干声高频本身就低, 会把好文件判成 4kHz。
 pub fn cutoff_hz(x: &[f64], sr: u32) -> Option<f64> {
     let n = CUT_NFFT;
     let db = ltas_db(x)?;
@@ -562,13 +526,10 @@ pub fn cutoff_hz(x: &[f64], sr: u32) -> Option<f64> {
             return Some(last as f64 * sr as f64 / n as f64);
         }
     }
-    Some(sr as f64 / 2.0)   // 没有砖墙 = 满带宽
+    Some(sr as f64 / 2.0) // 没有砖墙 = 满带宽
 }
 
-/// 乐句衰减段做 T20 线性外推 RT60, 取中位数。
-///
-/// 没有冲激响应可用, 这是估计值: 只保留拟合优度 R^2>0.9、时长合理、且整段都在底噪
-/// 之上的衰减段 —— 否则拟合会横穿乐句之间的停顿, 算出 3~30 秒的假混响。
+/// T20 外推 RT60, 取中位数。过长或穿过停顿的段会丢。
 pub fn rt60(db: &[f64], noise: Option<f64>) -> Option<Rt60> {
     if db.len() < 50 {
         return None;
@@ -593,7 +554,8 @@ pub fn rt60(db: &[f64], noise: Option<f64>) -> Option<Rt60> {
         let mut k = j;
         let mut ok = true;
         while k < n && db[k] > pk - RT60_TAIL {
-            if db[k] > pk {           // 中途又起声, 放弃本段
+            if db[k] > pk {
+                // 中途又起声, 放弃本段
                 ok = false;
                 break;
             }
@@ -654,13 +616,11 @@ pub fn rt60(db: &[f64], noise: Option<f64>) -> Option<Rt60> {
 pub struct Rt60 {
     pub median: f64,
     pub segments: usize,
-    /// 超过限值的段数。段与段之间本来就散(实测常差 10 倍), 所以别看离散度,
-    /// 要看有多少段真的超标 —— 合格的歌通常 0~33%, 判不合格的那首是 60%。
-    pub over_limit: usize,
+    pub over_limit: usize, // 单段 >= 0.3s 的段数
 }
 
 impl Rt60 {
-    /// 衰减段太少, 中位数证据不足, 不该单凭它退货。实测合格样本多在 18~58 段。
+    /// 段数 <10, 中位数证据不足。
     pub fn is_thin(&self) -> bool {
         self.segments < 10
     }
@@ -682,7 +642,9 @@ pub struct Track {
 }
 
 pub fn analyse(path: &Path, cfg: &Settings) -> Result<Track, String> {
-    let size = std::fs::metadata(path).map_err(|e| format!("读不到文件信息({e})"))?.len();
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("读不到文件信息({e})"))?
+        .len();
     if size == 0 {
         return Err("文件是空的(0 字节)".into());
     }
@@ -693,7 +655,6 @@ pub fn analyse(path: &Path, cfg: &Settings) -> Result<Track, String> {
     }
     let db = frame_db(&d.mono, d.sr);
     let noise = noise_floor_db(&db);
-    // 平均幅值的活动段判据可切换; 活动比例/底噪始终走能量阈值(定义如此)
     let mask = match cfg.avg_mode {
         AvgMode::Vad(m) => vad_mask(&d.mono, d.sr, m, db.len()),
         AvgMode::Energy => None,
@@ -703,56 +664,40 @@ pub fn analyse(path: &Path, cfg: &Settings) -> Result<Track, String> {
         path: path.to_path_buf(),
         sr: d.sr,
         dur,
-        // 码率用 文件字节数/时长 实测: 对 wav 和 mp3 都成立, 且 VBR 拿到的是真实均值
-        bitrate: size as f64 * 8.0 / dur / 1000.0,
+        bitrate: size as f64 * 8.0 / dur / 1000.0, // 文件字节/时长, VBR 也是真实均值
         active_s: active_seconds(&db),
         rms: active_rms_db(&d.mono, d.sr, &mask),
         noise,
         cutoff: cutoff_hz(&d.mono, d.sr),
         rt60: rt60(&db, noise),
-        // 峰值电平/削波都必须用 d.peak/d.clip_events (原始采样, 增益归一之前), 不能用 d.mono
-        peak_db: peak_dbfs(d.peak),
+        peak_db: peak_dbfs(d.peak), // 原始采样, 不能用增益归一后的 mono
         clip_events: d.clip_events,
     })
 }
 
 // ============================================================ 角色识别(文件名后缀)
-//
-// 曾经改成用 YAMNet 判内容, 不看文件名——分类模型内嵌进 exe 后体积从 9.5MB
-// 涨到 45MB, "是不是人声"判得很准, 但"混音 vs 纯伴奏"这条线样本不够、置信度
-// 明显更低, 单独扔一个混音文件时还想按帧识别人声更是测出来不可靠(拿已知的
-// 人声轨活动比例当真值验证, 固定阈值召回率只有 0.34, 换算下来"人声活动比例"
-// 会被系统性低估)。改回文件名后缀匹配, 按下面这套已知的真实命名规则识别:
-//   人声清唱 xxx_voc                => Role::Voc
-//   人声弹唱 xxx_vocselfacc         => Role::Voc(带自弹伴奏, 仍是人声表演本身)
-//   伴奏     xxx_inst               => Role::Ins
-//   清唱+伴奏合轨 xxx_vocandinst        => Role::Mix
-//   弹唱+伴奏合轨 xxx_vocselfaccandinst => Role::Mix
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
-    /// 合轨: 只有 *andinst 结尾的才是, 人声和伴奏已经混在一条轨里
-    Mix,
-    /// 人声轨(清唱 voc / 弹唱 vocselfacc): 都是独立人声轨, 不含伴奏
-    Voc,
+    Mix, // *andinst 合轨
+    Voc, // voc / vocselfacc
     Ins,
 }
 
-// 复合后缀必须排在被它包含的短后缀前面检查, 不然 "vocandinst" 会先被 "voc"
-// 吃掉, "vocselfaccandinst" 会先被 "vocselfacc" 吃掉。
+// 复合后缀必须排在被包含的短后缀前面, 否则 vocandinst 会被 voc 吃掉。
 const SUFFIX_PATTERNS: &[(&str, Role)] = &[
     ("vocselfaccandinst", Role::Mix), // 人声弹唱+伴奏合轨
     ("vocandinst", Role::Mix),        // 人声清唱+伴奏合轨
     ("vocselfacc", Role::Voc),        // 人声弹唱(独立人声轨, 不是合轨)
     ("vocals", Role::Voc),
     ("vocal", Role::Voc),
-    ("voc", Role::Voc),               // 人声清唱
-    ("vol", Role::Voc),                // 实际交付里出现过的手滑拼法(voc 误打成 vol)
+    ("voc", Role::Voc), // 人声清唱
+    ("vol", Role::Voc), // voc 的手滑拼法
     ("人声", Role::Voc),
     ("干声", Role::Voc),
     ("清唱", Role::Voc),
     ("instrumental", Role::Ins),
-    ("inst", Role::Ins),              // 伴奏
-    ("ins", Role::Ins),                // 伴奏的另一种缩写(与 inst 不冲突: "..inst"结尾不会被"ins"提前吃掉)
+    ("inst", Role::Ins), // 伴奏
+    ("ins", Role::Ins),
     ("acc", Role::Ins),
     ("伴奏", Role::Ins),
 ];
@@ -760,7 +705,7 @@ const VOC_BRACKET: [&str; 3] = ["vocal", "vocals", "人声"];
 const INS_BRACKET: [&str; 5] = ["instrumental", "inst", "ins", "off vocal", "伴奏"];
 
 fn strip_bracket(stem: &str, tokens: &[&str]) -> Option<String> {
-    let low = stem.to_ascii_lowercase();   // 只降 ASCII, 保证字节偏移与原串一致
+    let low = stem.to_ascii_lowercase(); // 只降 ASCII, 字节偏移与原串一致
     for t in tokens {
         for (o, c) in [('(', ')'), ('[', ']')] {
             let pat = format!("{o}{t}{c}");
@@ -774,19 +719,12 @@ fn strip_bracket(stem: &str, tokens: &[&str]) -> Option<String> {
     None
 }
 
-/// 把文件名拆成 (歌名, 角色)。
-///
-/// 角色只认结尾后缀(-Voc / _Ins / -人声 / _vocandinst 等)或带括号的标记
-/// ((Instrumental))。不能用"名字里含 ins"来判 —— 一整个文件夹的
-/// xxx_(Instrumental)(1).mp3 会被全判成同一首歌的伴奏轨, 只剩一条; 而
-/// Insane / Wins 这种词也会被误伤。
+/// (歌名, 角色)。只认结尾后缀或括号标记, 不用名字里含 ins。
 pub fn split_role(stem: &str) -> (String, Role) {
     if let Some(r) = match_role(stem) {
         return r;
     }
-    // 角色标记后面挂了副本编号("-Voc(1)"、"_voc_01")时, 去掉编号再认一次。
-    // 只有去掉之后真能认出角色才采纳 —— 否则保持原样, 不然 "歌名_1"/"歌名_2"
-    // 这种本来就不同的歌会被削成同一个歌名并进一组。
+    // 去掉副本编号后再认一次; 认不出则保持原名, 避免 歌名_1 / 歌名_2 被并组。
     let cut = strip_copy_suffix(stem);
     if cut.len() < stem.len() {
         if let Some(r) = match_role(cut) {
@@ -796,14 +734,13 @@ pub fn split_role(stem: &str) -> (String, Role) {
     (stem.to_string(), Role::Mix)
 }
 
-/// 认不出角色就返回 None(交给 split_role 决定怎么兜底)。
 fn match_role(stem: &str) -> Option<(String, Role)> {
     let low = stem.to_ascii_lowercase();
     for &(t, role) in SUFFIX_PATTERNS {
         if low.ends_with(t) {
             let base = &stem[..stem.len() - t.len()];
             let trimmed = base.trim_end_matches([' ', '_', '-']);
-            // 拉丁词要求前面有分隔符(避免 Wins 结尾被当成 ins); 中文标记不要求
+            // 拉丁词要求前面有分隔符, 避免 Wins 被当成 ins; 中文不要求
             if !t.is_ascii() || trimmed.len() < base.len() {
                 return Some((trimmed.to_string(), role));
             }
@@ -815,11 +752,9 @@ fn match_role(stem: &str) -> Option<(String, Role)> {
     strip_bracket(stem, &INS_BRACKET).map(|b| (b, Role::Ins))
 }
 
-/// 去掉结尾的副本编号: "(1)" "[2]" "-1" "_01" " 3"。批量导出和 Windows 复制都会
-/// 加这种尾巴, 挡在角色标记后面就会让整条轨认不出来。
+/// 去掉结尾副本编号 (1) / _01。无分隔符的 ID 尾巴不剥, 如 G000001。
 fn strip_copy_suffix(stem: &str) -> &str {
     let t = stem.trim_end();
-    // 括号编号 (1) / [2]
     if t.ends_with(')') || t.ends_with(']') {
         if let Some(p) = t.rfind(['(', '[']) {
             let inner = &t[p + 1..t.len() - 1];
@@ -828,8 +763,6 @@ fn strip_copy_suffix(stem: &str) -> &str {
             }
         }
     }
-    // 分隔符 + 纯数字结尾: -1 / _01 / 空格3。必须有分隔符, 不然
-    // "G000001" 这种 ID 会被啃掉尾巴。
     let head = t.trim_end_matches(|c: char| c.is_ascii_digit());
     if head.len() < t.len() && head.ends_with([' ', '_', '-']) {
         return head.trim_end_matches([' ', '_', '-']);
@@ -837,14 +770,12 @@ fn strip_copy_suffix(stem: &str) -> &str {
     t
 }
 
-/// 一组待校验的音频 = 一首歌。
 pub struct SongGroup {
     pub title: String,
     pub files: Vec<(PathBuf, Role)>,
 }
 
-/// 把一批音频按歌名分组。一个目录既可能是一首歌的 1~3 条轨, 也可能是一堆互不
-/// 相干的单曲(一整个文件夹的伴奏), 靠歌名分组区分。
+/// 按歌名分组。同一首歌可有多条 Voc/Mix, 不去重。
 pub fn group_audio(files: &[PathBuf]) -> Vec<SongGroup> {
     let mut order: Vec<String> = Vec::new();
     let mut songs: std::collections::HashMap<String, Vec<(PathBuf, Role)>> = Default::default();
@@ -852,13 +783,13 @@ pub fn group_audio(files: &[PathBuf]) -> Vec<SongGroup> {
     for p in files {
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let (base, role) = split_role(stem);
-        // 同一首歌可以合法出现两个 Voc 角色(voc + vocselfacc)和两个 Mix 角色
-        // (vocandinst + vocselfaccandinst), 所以按角色去重会误拆; 直接都收进同
-        // 一组, check_song 里每个文件各出各的一行, 互不覆盖。
-        songs.entry(base.clone()).or_insert_with(|| {
-            order.push(base.clone());
-            Vec::new()
-        }).push((p.clone(), role));
+        songs
+            .entry(base.clone())
+            .or_insert_with(|| {
+                order.push(base.clone());
+                Vec::new()
+            })
+            .push((p.clone(), role));
     }
 
     order
@@ -879,14 +810,11 @@ fn fmt_opt(v: Option<f64>, n: usize) -> String {
     }
 }
 
-/// 时长直接写毫秒整数(230000 就是 230 秒)。原来是 mm:ss, 那种写法在 Excel 里
-/// 是一串文本, 既不能排序也不能相减; 要的就是能直接拿来比对的数字。
-/// 时长本身是 采样数/采样率 算出来的, 毫秒位是真实数字不是凑的。
+/// 时长写成毫秒整数, 方便 Excel 排序。
 fn dur_ms(s: f64) -> String {
     format!("{}", (s * 1000.0).round().max(0.0) as i64)
 }
 
-/// 活动比例那两列: 有数字就写百分比, 没有就按角色写明原因(见 activity_placeholder)
 fn fmt_act(v: Option<f64>, role: Role, voc_col: bool) -> String {
     match v {
         Some(v) => format!("{:.1}%", v * 100.0),
@@ -894,12 +822,7 @@ fn fmt_act(v: Option<f64>, role: Role, voc_col: bool) -> String {
     }
 }
 
-/// 把一个文件自己的活动比例放进 (人声活动比例, 伴奏活动比例) 里, 另一列留空。
-///
-/// 合轨(Mix)算伴奏那一列: 伴奏是整首连续演奏的, 所以"合轨整体有声的时间"约等于
-/// "伴奏在响的时间", 拿来卡 >=80% 是有意义的。反过来"人声什么时候在唱"就不行了,
-/// 那要把混在一起的两个声源分开才知道 —— 实测音源分离模型在这件事上会系统性高估
-/// (残留的伴奏泄漏被当成人声活动), 足以让判定结果翻面, 所以这一列宁可留空。
+/// Mix 活动进伴奏列; 人声列留空(合轨分不开人声)。
 fn split_activity(role: Role, act: Option<f64>) -> (Option<f64>, Option<f64>) {
     match role {
         Role::Voc => (act, None),
@@ -907,8 +830,7 @@ fn split_activity(role: Role, act: Option<f64>) -> (Option<f64>, Option<f64>) {
     }
 }
 
-/// 那一列没有数字时显示什么。文件里压根没有这个声源就写明"无人声"/"无伴奏";
-/// 合轨是两个声源都有、只是分不出来, 那就留空 —— 写"无人声"会是假话。
+/// 合轨留空, 不要写成"无人声"。
 fn activity_placeholder(role: Role, voc_col: bool) -> &'static str {
     match (role, voc_col) {
         (Role::Ins, true) => "无人声",
@@ -917,7 +839,6 @@ fn activity_placeholder(role: Role, voc_col: bool) -> &'static str {
     }
 }
 
-/// 底噪上限按角色走两套: 人声一条, 伴奏和合轨共用另一条。
 fn noise_limit_db(role: Role, cfg: &Settings) -> f64 {
     match role {
         Role::Voc => cfg.voc_noise_db,
@@ -925,9 +846,27 @@ fn noise_limit_db(role: Role, cfg: &Settings) -> f64 {
     }
 }
 
-/// 平均幅值只卡人声和合轨。伴奏轨不判 —— 伴奏响度跨度大, 卡幅值会误杀正常垫底。
+/// 平均幅值只卡人声和合轨。
 fn checks_avg_db(role: Role) -> bool {
     !matches!(role, Role::Ins)
+}
+
+/// 每条轨各自记 RT60、各自卡 0.3s。测不出只备注。计算仍走 rt60()。
+fn apply_rt60(rt: Option<&Rt60>, fails: &mut Vec<String>, notes: &mut Vec<String>) {
+    match rt {
+        Some(v) => {
+            notes.push(format!("RT60 {:.2}s(混响时间)", v.median));
+            if v.median >= RT60_S {
+                let weak = if v.is_thin() {
+                    format!("(仅{}段, 建议复核)", v.segments)
+                } else {
+                    String::new()
+                };
+                fails.push(format!("混响时间RT60={:.2}s>=0.3s{weak}", v.median));
+            }
+        }
+        None => notes.push("RT60未测出(混响时间)".into()),
+    }
 }
 
 /// 校验一首歌, 每个音频出一行。root 用于把文件名显示成相对路径。
@@ -945,7 +884,6 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
     };
     let voc = get(Role::Voc);
     let ins = get(Role::Ins);
-    let mix = get(Role::Mix);
 
     let dur = tracks
         .iter()
@@ -953,16 +891,11 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
         .map(|t| t.dur)
         .fold(0.0f64, f64::max);
 
-    // 分贝差必须两条轨相减, 是唯一跨文件的指标; 活动比例改成每个文件各算各的
-    // (见下面 split_activity), 不再整组共用。
     let diff = match (voc, ins) {
         (Some(v), Some(i)) => Some(v.rms - i.rms),
         _ => None,
     };
-    // 混响优先按人声轨算, 其次混音, 只有伴奏轨就用伴奏
-    let rev = voc.or(mix).or(ins).and_then(|t| t.rt60.as_ref());
 
-    // 整首歌共用的判定, 会写进这首歌的每一行
     let mut song_fails: Vec<String> = Vec::new();
     let mut song_notes: Vec<String> = Vec::new();
     if let Some(v) = diff {
@@ -970,24 +903,6 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             song_fails.push(format!("人声伴奏分贝差{v:+.1}dB超出[-15,10]"));
         }
     }
-    // 备注只写"异常和额外信息", 正常情况下应该短到一眼扫过。
-    match rev {
-        Some(v) => {
-            // 括号里点明含义: 看表的人未必知道 RT60 是什么
-            song_notes.push(format!("RT60 {:.2}s(混响时间)", v.median));
-            if v.median >= RT60_S {
-                // 证据薄的时候提一句, 免得靠一个"看着很确定"的数字去退货
-                let weak = if v.is_thin() {
-                    format!("(仅{}段, 建议复核)", v.segments)
-                } else {
-                    String::new()
-                };
-                song_fails.push(format!("混响时间RT60={:.2}s>=0.3s{weak}", v.median));
-            }
-        }
-        None => song_notes.push("RT60未测出(混响时间)".into()),
-    }
-    // 空着的那几列已经说明"没测", 这里只需点出是缺哪条轨, 不用把指标名列一遍
     let miss: Vec<&str> = [("人声轨", voc.is_none()), ("伴奏轨", ins.is_none())]
         .iter()
         .filter(|(_, m)| *m)
@@ -997,12 +912,19 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
         song_notes.push(format!("无{}", miss.join("和")));
     }
 
-    // 每个文件先各算各的; 整首歌的判定要等所有文件都算完才知道(见 apply_group_verdict)
     let mut drafts: Vec<Draft> = Vec::new();
     for ((role, res), (path, _)) in tracks.iter().zip(&group.files) {
         let name = match root {
-            Some(r) => path.strip_prefix(r).unwrap_or(path).to_string_lossy().to_string(),
-            None => path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            Some(r) => path
+                .strip_prefix(r)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string(),
+            None => path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
         };
         let ext = path
             .extension()
@@ -1010,16 +932,22 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             .unwrap_or("")
             .to_ascii_uppercase();
 
-        // 点名用短文件名: 相对路径太长, 挤在"是否满足要求"里看不清
-        let short = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let short = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
 
         let t = match res {
             Err(e) => {
-                // 单个文件坏掉不耽误同组其他文件出数, 但这首歌整体还是不合格
                 let mut cells = vec![String::new(); COLUMNS.len()];
                 cells[0] = name;
                 cells[1] = ext;
-                drafts.push(Draft { cells, fails: vec![e.clone()], name: short });
+                drafts.push(Draft {
+                    cells,
+                    fails: vec![e.clone()],
+                    name: short,
+                });
                 continue;
             }
             Ok(t) => t,
@@ -1028,8 +956,11 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
         let mut fails = song_fails.clone();
         let mut notes = song_notes.clone();
 
-        // 活动比例是"这个文件自己的活动时长 / 整歌时长", 每个文件只填自己那一列
-        let act = if dur > 0.0 { Some(t.active_s / dur) } else { None };
+        let act = if dur > 0.0 {
+            Some(t.active_s / dur)
+        } else {
+            None
+        };
         let (voc_act, ins_act) = split_activity(*role, act);
         if *role == Role::Mix && ins_act.is_some() {
             notes.push("伴奏活动比例按合轨整体活动计".into());
@@ -1049,17 +980,13 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
         }
         match t.cutoff {
             None => notes.push("截止频率未测出".into()),
-            Some(c) if c < CUTOFF_HZ => {
-                fails.push(format!("截止频率{:.1}kHz<15kHz", c / 1000.0))
-            }
+            Some(c) if c < CUTOFF_HZ => fails.push(format!("截止频率{:.1}kHz<15kHz", c / 1000.0)),
             Some(_) => {}
         }
         let noise_lim = noise_limit_db(*role, cfg);
         match t.noise {
             None => notes.push("底噪未测(无静音段)".into()),
-            Some(nf) if nf >= noise_lim => {
-                fails.push(format!("底噪{nf:.1}dBFS高于{noise_lim}"))
-            }
+            Some(nf) if nf >= noise_lim => fails.push(format!("底噪{nf:.1}dBFS高于{noise_lim}")),
             Some(_) => {}
         }
         match t.peak_db {
@@ -1069,21 +996,16 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             }
             Some(_) => {}
         }
-        // 平均幅值 = 活动段 RMS(t.rms), 跟峰值电平是两回事: 峰值管"顶没顶到头",
-        // 平均幅值管"整体响不响"——同一个峰值下, 平均幅值越高说明动态压得越死。
-        // 伴奏轨不卡这项, 只写数字给人看。
         if checks_avg_db(*role) && !(cfg.avg_db_lo..=cfg.avg_db_hi).contains(&t.rms) {
             fails.push(format!(
                 "平均幅值{:.1}dBFS超出[{},{}]",
                 t.rms, cfg.avg_db_lo, cfg.avg_db_hi
             ));
         }
-        // 削波是硬性禁止项, 跟峰值范围分开报: 峰值超标只是"响", 削波是"failed 已经失真"。
-        // 一个文件出现削波时峰值必然也贴着 0dBFS、峰值检查本来就会一起不合格,
-        // 这里单独给个明确原因, 免得被当成只是"没控制好响度"这种轻微问题。
         if t.clip_events > 0 {
             fails.push(format!("检测到削波({}处连续触顶采样)", t.clip_events));
         }
+        apply_rt60(t.rt60.as_ref(), &mut fails, &mut notes);
 
         let cells = vec![
             name,
@@ -1098,28 +1020,32 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             fmt_opt(diff, 1),
             fmt_opt(t.peak_db, 1),
             format!("{:.1}", t.rms),
-            if t.clip_events > 0 { format!("是({}处)", t.clip_events) } else { "否".into() },
-            String::new(),    // 判定列等整组汇总完再填
+            if t.clip_events > 0 {
+                format!("是({}处)", t.clip_events)
+            } else {
+                "否".into()
+            },
+            String::new(), // 判定列等整组汇总完再填
             notes.join("；"),
         ];
-        drafts.push(Draft { cells, fails, name: short });
+        drafts.push(Draft {
+            cells,
+            fails,
+            name: short,
+        });
     }
 
     apply_group_verdict(&mut drafts);
     drafts.into_iter().map(|d| d.cells).collect()
 }
 
-/// check_song 的中间态: 一行的单元格 + 这个文件自己的不合格原因 + 点名用的文件名。
 struct Draft {
     cells: Vec<String>,
     fails: Vec<String>,
     name: String,
 }
 
-/// 填"是否满足要求"这一列。一首歌是一个交付单元 —— 人声、伴奏、合轨要一起返工,
-/// 所以组里只要有一个文件不合格, 这首歌的每一行都判"否"。
-/// 自己没毛病的那几行写清楚是被哪个文件带下来的, 否则看表的人对着一行全绿的数字
-/// 会以为判错了, 也不知道该去修哪个文件。
+/// 组内任一文件不合格, 整首歌每行都判否。
 fn apply_group_verdict(drafts: &mut [Draft]) {
     let bad: Vec<String> = drafts
         .iter()
@@ -1142,7 +1068,6 @@ fn apply_group_verdict(drafts: &mut [Draft]) {
 mod tests {
     use super::*;
 
-    /// 时长是毫秒整数, 不是 mm:ss —— 这一列要能在 Excel 里直接排序相减。
     #[test]
     fn duration_is_plain_milliseconds() {
         assert_eq!(dur_ms(0.0), "0");
@@ -1151,7 +1076,6 @@ mod tests {
         assert_eq!(dur_ms(59.9996), "60000");
     }
 
-    /// 一首歌里有一个文件不合格, 同组每一行都得判"否", 并写明是被谁带下来的。
     #[test]
     fn one_bad_file_fails_the_whole_song() {
         let draft = |name: &str, fails: Vec<String>| Draft {
@@ -1181,19 +1105,29 @@ mod tests {
             draft("c_vocandinst.wav", vec![]),
         ];
         apply_group_verdict(&mut two);
-        assert_eq!(two[2].cells[VERDICT_COL], "否：同组c_voc.wav、c_inst.wav不合格");
+        assert_eq!(
+            two[2].cells[VERDICT_COL],
+            "否：同组c_voc.wav、c_inst.wav不合格"
+        );
     }
 
-    /// is_pcm_codec 靠 symphonia 的编号区间判断, 升级依赖后编号一旦挪动
-    /// 这里会当场失败 —— 别改成"跟着新编号调区间"就完事, 要确认 A-law/μ-law
-    /// 这类压扩编码仍然在区间外。
     #[test]
     fn pcm_codec_range_excludes_companded() {
         use symphonia::core::codecs::audio::well_known::*;
-        for id in [CODEC_ID_PCM_S16LE, CODEC_ID_PCM_S24LE, CODEC_ID_PCM_S32LE, CODEC_ID_PCM_F32LE] {
+        for id in [
+            CODEC_ID_PCM_S16LE,
+            CODEC_ID_PCM_S24LE,
+            CODEC_ID_PCM_S32LE,
+            CODEC_ID_PCM_F32LE,
+        ] {
             assert!(is_pcm_codec(id), "{id:?} 应该算未压缩 PCM");
         }
-        for id in [CODEC_ID_PCM_ALAW, CODEC_ID_PCM_MULAW, CODEC_ID_ADPCM_MS, CODEC_ID_MP3] {
+        for id in [
+            CODEC_ID_PCM_ALAW,
+            CODEC_ID_PCM_MULAW,
+            CODEC_ID_ADPCM_MS,
+            CODEC_ID_MP3,
+        ] {
             assert!(!is_pcm_codec(id), "{id:?} 不该算未压缩 PCM");
         }
     }
@@ -1209,7 +1143,9 @@ mod tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let u = ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
                 u * amp
             })
@@ -1268,7 +1204,11 @@ mod tests {
         let sr = 48000;
         let n = 20 * sr as usize;
         let x = noise(n, 0.3, 3);
-        assert_eq!(cutoff_hz(&x, sr), Some(sr as f64 / 2.0), "满带宽应为奈奎斯特");
+        assert_eq!(
+            cutoff_hz(&x, sr),
+            Some(sr as f64 / 2.0),
+            "满带宽应为奈奎斯特"
+        );
 
         // 12kHz 砖墙低通: 频域截断再逆变换
         let mut planner = FftPlanner::<f64>::new();
@@ -1342,8 +1282,7 @@ mod tests {
         }
         assert_eq!(events, 0, "孤立触顶采样不算削波");
 
-        // -0.5dB 阈值应该比原来的 0.999(-0.0087dB) 松: 贴近但没完全触顶满量程
-        // 的连续采样也该算削波, 这是这次放宽阈值要解决的场景。
+        // 0.95 ≈ -0.45dBFS, 连续触顶也算削波
         let mut run = 0usize;
         let mut events = 0usize;
         for v in [0.5, 0.95, 0.95, 0.95, 0.5] {
@@ -1359,7 +1298,7 @@ mod tests {
         assert_eq!(split_role("下雨天-Voc"), ("下雨天".into(), Role::Voc));
         assert_eq!(split_role("下雨天_伴奏"), ("下雨天".into(), Role::Ins));
         assert_eq!(split_role("x_(Instrumental)(1)").1, Role::Ins);
-        assert_eq!(split_role("Insane Wins").1, Role::Mix);   // 普通词里的 ins 不算
+        assert_eq!(split_role("Insane Wins").1, Role::Mix); // 普通词里的 ins 不算
         // 实际交付里出现过的手滑拼法: voc 误打成 vol
         assert_eq!(
             split_role("ZH_T1_S000001_G000233_vol"),
@@ -1386,8 +1325,6 @@ mod tests {
 
     #[test]
     fn vad_mask_falls_back_when_it_finds_nothing() {
-        // VAD 一帧都判不出人声时必须返回 None, 让调用方退回能量阈值 ——
-        // 不然平均幅值会拿零星几帧去算, 数字没有意义
         let sr = 48000;
         let quiet = vec![0.0f64; 3 * sr as usize];
         let frames = frame_db(&quiet, sr).len();
@@ -1399,9 +1336,12 @@ mod tests {
 
     #[test]
     fn role_survives_copy_suffix() {
-        // 角色标记后面挂了副本编号也要认出来, 而且要跟没挂编号的归到同一首歌 ——
-        // 认不出来就会掉进 Mix 分支, 伴奏那列被填上"合轨整体活动", 看着像真的测过
-        for s in ["下雨天-Voc(1)", "下雨天-Voc-1", "下雨天_voc_01", "下雨天-Voc 2"] {
+        for s in [
+            "下雨天-Voc(1)",
+            "下雨天-Voc-1",
+            "下雨天_voc_01",
+            "下雨天-Voc 2",
+        ] {
             assert_eq!(split_role(s), ("下雨天".into(), Role::Voc), "{s}");
         }
         assert_eq!(split_role("下雨天-Ins(1)"), ("下雨天".into(), Role::Ins));
@@ -1409,13 +1349,17 @@ mod tests {
         assert_eq!(split_role("下雨天-干声"), ("下雨天".into(), Role::Voc));
         assert_eq!(split_role("下雨天-清唱"), ("下雨天".into(), Role::Voc));
 
-        // 去掉编号也认不出角色时, 必须保留原名 —— 否则 "歌名_1"/"歌名_2"
-        // 这种本来不同的歌会被削成同一个歌名并进一组
         assert_eq!(split_role("歌名_1"), ("歌名_1".into(), Role::Mix));
         assert_eq!(split_role("歌名_2"), ("歌名_2".into(), Role::Mix));
-        assert_eq!(group_audio(&[PathBuf::from("歌名_1.wav"), PathBuf::from("歌名_2.wav")]).len(), 2);
+        assert_eq!(
+            group_audio(&[PathBuf::from("歌名_1.wav"), PathBuf::from("歌名_2.wav")]).len(),
+            2
+        );
         // ID 尾部的数字不能被当成副本编号啃掉
-        assert_eq!(split_role("ZH_T1_S000001_G000001").0, "ZH_T1_S000001_G000001");
+        assert_eq!(
+            split_role("ZH_T1_S000001_G000001").0,
+            "ZH_T1_S000001_G000001"
+        );
     }
 
     #[test]
@@ -1458,8 +1402,6 @@ mod tests {
             ("ZH_T1_S000001_G000001".into(), Role::Mix)
         );
 
-        // 全部 5 个文件同名同基座, 应分到同一组(vocandinst/vocselfaccandinst
-        // 与 voc/vocselfacc 都判 base 不同角色, 不会互相当"同名同角色"顶掉)
         let files: Vec<PathBuf> = [
             "ZH_T1_S000001_G000001_voc.wav",
             "ZH_T1_S000001_G000001_vocselfacc.wav",
@@ -1475,7 +1417,34 @@ mod tests {
         assert_eq!(g[0].files.len(), 5);
     }
 
-    /// 底噪两套上限、平均幅值只卡人声/合轨 —— 这是这次按角色拆开判定的契约。
+    #[test]
+    fn rt60_judged_per_track() {
+        let mut fails = Vec::new();
+        let mut notes = Vec::new();
+        apply_rt60(None, &mut fails, &mut notes);
+        assert!(fails.is_empty(), "测不出不判不合格");
+        assert!(notes.iter().any(|n| n.contains("未测出")));
+
+        fails.clear();
+        notes.clear();
+        apply_rt60(
+            Some(&Rt60 { median: 0.20, segments: 20, over_limit: 0 }),
+            &mut fails,
+            &mut notes,
+        );
+        assert!(fails.is_empty());
+        assert!(notes.iter().any(|n| n.contains("0.20")));
+
+        fails.clear();
+        notes.clear();
+        apply_rt60(
+            Some(&Rt60 { median: 0.40, segments: 20, over_limit: 1 }),
+            &mut fails,
+            &mut notes,
+        );
+        assert!(fails.iter().any(|f| f.contains(">=0.3s")));
+    }
+
     #[test]
     fn noise_and_avg_rules_depend_on_role() {
         let cfg = Settings {
@@ -1485,7 +1454,11 @@ mod tests {
         };
         assert_eq!(noise_limit_db(Role::Voc, &cfg), -50.0);
         assert_eq!(noise_limit_db(Role::Ins, &cfg), -40.0);
-        assert_eq!(noise_limit_db(Role::Mix, &cfg), -40.0, "合轨跟伴奏走同一条底噪上限");
+        assert_eq!(
+            noise_limit_db(Role::Mix, &cfg),
+            -40.0,
+            "合轨跟伴奏走同一条底噪上限"
+        );
         assert!(checks_avg_db(Role::Voc));
         assert!(!checks_avg_db(Role::Ins), "伴奏不卡平均幅值");
         assert!(checks_avg_db(Role::Mix), "合轨仍卡平均幅值");
