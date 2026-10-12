@@ -327,7 +327,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.busy, |ui| {
-                    ui.label("平均幅值 活动段判据");
+                    ui.label("人声伴奏分贝差 活动段判据");
                     let cur = match self.cfg.avg_mode {
                         analysis::AvgMode::Energy => "能量阈值",
                         analysis::AvgMode::Vad(0) => "VAD 0 (最宽松)",
@@ -352,22 +352,6 @@ impl eframe::App for App {
                         );
 
                     ui.add_space(12.0);
-                    ui.label("合格范围(人声/合轨)");
-                    ui.add(
-                        egui::DragValue::new(&mut self.cfg.avg_db_lo)
-                            .speed(0.5)
-                            .range(-60.0..=0.0)
-                            .suffix(" dBFS"),
-                    )
-                    .on_hover_text("只卡人声轨和合轨。伴奏轨不判平均幅值。");
-                    ui.label("～");
-                    ui.add(
-                        egui::DragValue::new(&mut self.cfg.avg_db_hi)
-                            .speed(0.5)
-                            .range(-60.0..=0.0)
-                            .suffix(" dBFS"),
-                    )
-                    .on_hover_text("只卡人声轨和合轨。伴奏轨不判平均幅值。");
                     if ui.button("恢复默认").clicked() {
                         self.cfg = analysis::Settings::default();
                     }
@@ -445,7 +429,7 @@ mod result_table {
     /// 每列宽度, 与 analysis::COLUMNS 一一对应 —— 界面显示的字段必须和 csv 完全一致,
     /// 不另起一套简称。全部定宽: truncate() 会去索取"可用宽度", 而在可横向滚动的
     /// ScrollArea 里可用宽度又取决于滚动条在不在, 两者每帧互相追逐, 窗口就会闪。
-    const WIDTHS: [f32; 16] = [
+    const WIDTHS: [f32; 13] = [
         250.0, // 文件名
         48.0,  // 格式
         62.0,  // 采样率
@@ -456,9 +440,6 @@ mod result_table {
         86.0,  // 人声活动比例
         86.0,  // 伴奏活动比例
         98.0,  // 人声伴奏分贝差
-        72.0,  // 峰值电平
-        72.0,  // 平均幅值
-        84.0,  // 是否削波
         64.0,  // RT60
         300.0, // 是否满足要求
         320.0, // 备注（如有）

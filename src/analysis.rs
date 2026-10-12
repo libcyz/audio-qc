@@ -6,7 +6,7 @@ use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
 
 // ---- CSV 表头 (交付方规定, 顺序不要动) --------------------------------------
-pub const COLUMNS: [&str; 16] = [
+pub const COLUMNS: [&str; 13] = [
     "文件名",
     "格式",
     "采样率",
@@ -17,9 +17,6 @@ pub const COLUMNS: [&str; 16] = [
     "人声活动比例",
     "伴奏活动比例",
     "人声伴奏分贝差",
-    "峰值电平",
-    "平均幅值",
-    "是否削波",
     "RT60",
     "是否满足要求",
     "备注（如有）",
@@ -37,12 +34,9 @@ pub const BITRATE_KBPS: f64 = 320.0; // 码率 >=
 pub const VOC_NOISE_DBFS: f64 = -40.0; // 人声底噪 < , 界面可改
 pub const INS_NOISE_DBFS: f64 = -40.0; // 伴奏及合轨底噪 < , 界面可改
 pub const RT60_S: f64 = 0.30; // RT60 <
-pub const PEAK_DB_MAX: f64 = -1.0; // 峰值上限, 无下限
-pub const AVG_DB_LO: f64 = -26.0; // 平均幅值下限; 伴奏不卡
-pub const AVG_DB_HI: f64 = -3.0; // 平均幅值上限; 伴奏不卡
 
 // ---- 界面可调参数 -----------------------------------------------------------
-/// 只影响平均幅值的活动段。活动比例和底噪始终用能量阈值。
+/// 只影响平均 RMS 的活动段(人声伴奏分贝差用它)。活动比例和底噪始终用能量阈值。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AvgMode {
     /// 高于本轨 P95-35dB。
@@ -54,8 +48,6 @@ pub enum AvgMode {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub avg_mode: AvgMode,
-    pub avg_db_lo: f64,
-    pub avg_db_hi: f64,
     pub voc_noise_db: f64, // 人声底噪上限
     pub ins_noise_db: f64, // 伴奏/合轨底噪上限
 }
@@ -64,8 +56,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             avg_mode: AvgMode::Vad(1),
-            avg_db_lo: AVG_DB_LO,
-            avg_db_hi: AVG_DB_HI,
             voc_noise_db: VOC_NOISE_DBFS,
             ins_noise_db: INS_NOISE_DBFS,
         }
@@ -812,8 +802,20 @@ fn fmt_opt(v: Option<f64>, n: usize) -> String {
 }
 
 /// 时长写成毫秒整数, 方便 Excel 排序。
+fn to_ms(s: f64) -> i64 {
+    (s * 1000.0).round().max(0.0) as i64
+}
+
 fn dur_ms(s: f64) -> String {
-    format!("{}", (s * 1000.0).round().max(0.0) as i64)
+    to_ms(s).to_string()
+}
+
+/// 同组时长按毫秒(与时长列一致)比, 必须完全相同。少于两条测得出的轨不判。
+fn duration_mismatch(durs: &[f64]) -> Option<String> {
+    let ms: Vec<i64> = durs.iter().map(|&d| to_ms(d)).collect();
+    let lo = *ms.iter().min()?;
+    let hi = *ms.iter().max()?;
+    (lo != hi).then(|| format!("同组时长不一致({lo}ms~{hi}ms)"))
 }
 
 fn fmt_act(v: Option<f64>, role: Role, voc_col: bool) -> String {
@@ -845,11 +847,6 @@ fn noise_limit_db(role: Role, cfg: &Settings) -> f64 {
         Role::Voc => cfg.voc_noise_db,
         Role::Ins | Role::Mix => cfg.ins_noise_db,
     }
-}
-
-/// 平均幅值只卡人声和合轨。
-fn checks_avg_db(role: Role) -> bool {
-    !matches!(role, Role::Ins)
 }
 
 /// 每条轨各自卡 0.3s。返回 RT60 列要写的数(秒, 两位小数); 测不出留空, 不进备注。
@@ -899,6 +896,14 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
 
     let mut song_fails: Vec<String> = Vec::new();
     let mut song_notes: Vec<String> = Vec::new();
+    let durs: Vec<f64> = tracks
+        .iter()
+        .filter_map(|(_, t)| t.as_ref().ok())
+        .map(|t| t.dur)
+        .collect();
+    if let Some(f) = duration_mismatch(&durs) {
+        song_fails.push(f);
+    }
     if let Some(v) = diff {
         if !(RMS_DIFF_LO..=RMS_DIFF_HI).contains(&v) {
             song_fails.push(format!("人声伴奏分贝差{v:+.1}dB超出[-15,10]"));
@@ -990,22 +995,6 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             Some(nf) if nf >= noise_lim => fails.push(format!("底噪{nf:.1}dBFS高于{noise_lim}")),
             Some(_) => {}
         }
-        match t.peak_db {
-            None => notes.push("峰值电平未测出".into()),
-            Some(pk) if pk > PEAK_DB_MAX => {
-                fails.push(format!("峰值电平{pk:.1}dBFS超过{PEAK_DB_MAX}dBFS"))
-            }
-            Some(_) => {}
-        }
-        if checks_avg_db(*role) && !(cfg.avg_db_lo..=cfg.avg_db_hi).contains(&t.rms) {
-            fails.push(format!(
-                "平均幅值{:.1}dBFS超出[{},{}]",
-                t.rms, cfg.avg_db_lo, cfg.avg_db_hi
-            ));
-        }
-        if t.clip_events > 0 {
-            fails.push(format!("检测到削波({}处连续触顶采样)", t.clip_events));
-        }
         let rt60_cell = apply_rt60(t.rt60.as_ref(), &mut fails);
 
         let cells = vec![
@@ -1019,13 +1008,6 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             fmt_act(voc_act, *role, true),
             fmt_act(ins_act, *role, false),
             fmt_opt(diff, 1),
-            fmt_opt(t.peak_db, 1),
-            format!("{:.1}", t.rms),
-            if t.clip_events > 0 {
-                format!("是({}处)", t.clip_events)
-            } else {
-                "否".into()
-            },
             rt60_cell,
             String::new(), // 判定列等整组汇总完再填
             notes.join("；"),
@@ -1076,6 +1058,18 @@ mod tests {
         assert_eq!(dur_ms(230.0), "230000");
         assert_eq!(dur_ms(225.4134), "225413");
         assert_eq!(dur_ms(59.9996), "60000");
+    }
+
+    #[test]
+    fn group_durations_must_match_to_the_ms() {
+        assert_eq!(duration_mismatch(&[]), None);
+        assert_eq!(duration_mismatch(&[225.4134]), None, "单个文件不判");
+        // 时长列显示一样(同一毫秒)就算一致
+        assert_eq!(duration_mismatch(&[225.4134, 225.4131, 225.4129]), None);
+        assert_eq!(
+            duration_mismatch(&[225.413, 225.414, 230.0]),
+            Some("同组时长不一致(225413ms~230000ms)".into())
+        );
     }
 
     #[test]
@@ -1450,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn noise_and_avg_rules_depend_on_role() {
+    fn noise_rules_depend_on_role() {
         let cfg = Settings {
             voc_noise_db: -50.0,
             ins_noise_db: -40.0,
@@ -1463,9 +1457,6 @@ mod tests {
             -40.0,
             "合轨跟伴奏走同一条底噪上限"
         );
-        assert!(checks_avg_db(Role::Voc));
-        assert!(!checks_avg_db(Role::Ins), "伴奏不卡平均幅值");
-        assert!(checks_avg_db(Role::Mix), "合轨仍卡平均幅值");
 
         let def = Settings::default();
         assert_eq!(def.voc_noise_db, VOC_NOISE_DBFS);
