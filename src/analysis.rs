@@ -55,7 +55,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            avg_mode: AvgMode::Vad(1),
+            avg_mode: AvgMode::Energy,
             voc_noise_db: VOC_NOISE_DBFS,
             ins_noise_db: INS_NOISE_DBFS,
         }
