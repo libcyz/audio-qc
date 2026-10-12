@@ -83,7 +83,9 @@ jobs:
           path: AudioQC.exe
 
   linux:
-    runs-on: ubuntu-latest
+    # 用较老的 22.04 编: 二进制只认编译机及更新的 glibc, 在 latest 上编的
+    # 拿到稍旧的发行版上会报 GLIBC_2.xx not found, 打不开。
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,11 +98,19 @@ jobs:
         run: cargo test --release
       - name: 编译
         run: cargo build --release
-      - run: cp target/release/audio_qc AudioQC-linux
+      # 裸二进制经浏览器下载会丢掉可执行权限, 双击打不开; upload-artifact 打 zip
+      # 也会丢。所以先装进 tar.gz —— tar 会把 +x 一起存进去, 解压出来就能直接运行。
+      - name: 打成 tar.gz
+        run: |
+          mkdir AudioQC-linux
+          cp target/release/audio_qc AudioQC-linux/AudioQC
+          chmod +x AudioQC-linux/AudioQC
+          tar czf AudioQC-linux.tar.gz AudioQC-linux
+          tar tvzf AudioQC-linux.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: AudioQC-Linux
-          path: AudioQC-linux
+          path: AudioQC-linux.tar.gz
 
   # 每次推送都出包, 不会再跳过 release:
   # - 打 v1.0 这类标签 → 发对应版本的正式 Release
@@ -117,7 +127,7 @@ jobs:
           files: |
             AudioQC-macOS/AudioQC-macOS.dmg
             AudioQC-Windows/AudioQC.exe
-            AudioQC-Linux/AudioQC-linux
+            AudioQC-Linux/AudioQC-linux.tar.gz
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '最新构建 (latest)' }}
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -130,6 +140,8 @@ jobs:
               （或终端跑 `xattr -dr com.apple.quarantine /Applications/AudioQC.app`）。
               这是未签名二进制的正常提示，要消除需要 Apple 开发者证书。
             - Windows: 直接下载 AudioQC.exe。
-            - Linux: 下载 AudioQC-linux，`chmod +x` 后运行。
+            - Linux: 下载 AudioQC-linux.tar.gz，双击解压，进入 AudioQC-linux 文件夹，
+              双击 AudioQC（GNOME「文件」里是右键 →「作为程序运行」）。
+              不需要 chmod。
 
             用法：把音频文件或文件夹拖进窗口，结果 CSV 写在拖进来的位置旁边。
