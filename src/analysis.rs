@@ -78,6 +78,7 @@ const ACT_ABS_DBFS: f64 = -55.0; // 且高于该绝对电平
 pub const SILENCE_DBFS: f64 = -90.0; // 低于此视为剪辑留白, 不算底噪
 pub const MIN_SILENCE_S: f64 = 0.5; // 静音短于此不报底噪
 const MIN_DURATION_S: f64 = 1.0;
+const DUR_TOL_S: f64 = 0.001; // 同组时长相差不到 1ms 算一致
 
 pub const CUT_NFFT: usize = 8192;
 const CUT_MAX_FRAMES: usize = 300;
@@ -812,12 +813,14 @@ fn dur_ms(s: f64) -> String {
     to_ms(s).to_string()
 }
 
-/// 同组时长按毫秒(与时长列一致)比, 必须完全相同。少于两条测得出的轨不判。
+/// 同组最长与最短相差不到 1ms 算一致。比原始秒数, 不比取整后的毫秒: 采样率不同
+/// (48k/44.1k)的同长文件会差几微秒, 正好跨在 .5ms 上时取整会差出 1ms。
+/// 少于两条测得出的轨不判。
 fn duration_mismatch(durs: &[f64]) -> Option<String> {
-    let ms: Vec<i64> = durs.iter().map(|&d| to_ms(d)).collect();
-    let lo = *ms.iter().min()?;
-    let hi = *ms.iter().max()?;
-    (lo != hi).then(|| format!("同组时长不一致({lo}ms~{hi}ms)"))
+    let lo = durs.iter().copied().reduce(f64::min)?;
+    let hi = durs.iter().copied().reduce(f64::max)?;
+    (hi - lo >= DUR_TOL_S)
+        .then(|| format!("同组时长不一致({}ms~{}ms)", to_ms(lo), to_ms(hi)))
 }
 
 fn fmt_act(v: Option<f64>, role: Role, voc_col: bool) -> String {
@@ -1081,11 +1084,21 @@ mod tests {
     }
 
     #[test]
-    fn group_durations_must_match_to_the_ms() {
+    fn group_durations_must_match_within_1ms() {
         assert_eq!(duration_mismatch(&[]), None);
         assert_eq!(duration_mismatch(&[225.4134]), None, "单个文件不判");
-        // 时长列显示一样(同一毫秒)就算一致
         assert_eq!(duration_mismatch(&[225.4134, 225.4131, 225.4129]), None);
+        // 11524: 48k 两轨 12260136 采样, 44.1k 合轨 11264000 采样, 只差约 1 微秒
+        assert_eq!(
+            duration_mismatch(&[12260136.0 / 48000.0, 11264000.0 / 44100.0]),
+            None
+        );
+        // 跨在 .5ms 两侧: 取整是 1000ms / 1001ms, 实际只差 0.2 微秒
+        assert_eq!(duration_mismatch(&[1.0004999, 1.0005001]), None);
+        assert_eq!(
+            duration_mismatch(&[225.413, 225.4152]),
+            Some("同组时长不一致(225413ms~225415ms)".into())
+        );
         assert_eq!(
             duration_mismatch(&[225.413, 225.414, 230.0]),
             Some("同组时长不一致(225413ms~230000ms)".into())
