@@ -859,7 +859,7 @@ fn spec_limits(role: Role) -> (f64, f64) {
     }
 }
 
-/// 每条轨各自卡 0.3s。返回 RT60 列要写的数(秒, 两位小数); 测不出留空, 不进备注。
+/// 人声轨卡 0.3s(伴奏、合轨不调用)。返回 RT60 列要写的数(秒, 两位小数); 测不出留空, 不进备注。
 fn apply_rt60(rt: Option<&Rt60>, fails: &mut Vec<String>) -> String {
     match rt {
         Some(v) => {
@@ -1010,11 +1010,11 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             Some(nf) if nf >= noise_lim => fails.push(format!("底噪{nf:.1}dBFS高于{noise_lim}")),
             Some(_) => {}
         }
-        // 伴奏轨不测混响: 不判定, RT60 列留空
-        let rt60_cell = if *role == Role::Ins {
-            String::new()
-        } else {
+        // 只测人声轨的混响; 伴奏不测, 合轨里有伴奏也不测, RT60 列留空
+        let rt60_cell = if *role == Role::Voc {
             apply_rt60(t.rt60.as_ref(), &mut fails)
+        } else {
+            String::new()
         };
 
         let cells = vec![
