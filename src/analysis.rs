@@ -29,8 +29,10 @@ pub const INS_ACTIVITY: f64 = 0.80; // 伴奏活动比例 >=
 pub const VOC_ACTIVITY: f64 = 0.40; // 人声活动比例 >=
 pub const RMS_DIFF_LO: f64 = -15.0; // 人声-伴奏 平均RMS差 dB, 下限
 pub const RMS_DIFF_HI: f64 = 10.0; // 上限
-pub const CUTOFF_HZ: f64 = 15000.0; // 截止频率 >=
-pub const BITRATE_KBPS: f64 = 320.0; // 码率 >=
+pub const CUTOFF_HZ: f64 = 15000.0; // 人声/合轨截止频率 >=
+pub const BITRATE_KBPS: f64 = 320.0; // 人声/合轨码率 >=
+pub const INS_CUTOFF_HZ: f64 = 11000.0; // 伴奏截止频率 >=
+pub const INS_BITRATE_KBPS: f64 = 128.0; // 伴奏码率 >=
 pub const VOC_NOISE_DBFS: f64 = -40.0; // 人声底噪 < , 界面可改
 pub const INS_NOISE_DBFS: f64 = -40.0; // 伴奏及合轨底噪 < , 界面可改
 pub const RT60_S: f64 = 0.30; // RT60 <
@@ -849,6 +851,14 @@ fn noise_limit_db(role: Role, cfg: &Settings) -> f64 {
     }
 }
 
+/// (截止频率 Hz, 码率 kbps) 下限。只有伴奏放宽, 合轨仍按人声的标准。
+fn spec_limits(role: Role) -> (f64, f64) {
+    match role {
+        Role::Ins => (INS_CUTOFF_HZ, INS_BITRATE_KBPS),
+        Role::Voc | Role::Mix => (CUTOFF_HZ, BITRATE_KBPS),
+    }
+}
+
 /// 每条轨各自卡 0.3s。返回 RT60 列要写的数(秒, 两位小数); 测不出留空, 不进备注。
 fn apply_rt60(rt: Option<&Rt60>, fails: &mut Vec<String>) -> String {
     match rt {
@@ -981,12 +991,17 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
                 fails.push(format!("人声活动比例{:.1}%<40%", v * 100.0));
             }
         }
-        if t.bitrate < BITRATE_KBPS {
-            fails.push(format!("码率{:.0}kbps<320", t.bitrate));
+        let (cutoff_lim, bitrate_lim) = spec_limits(*role);
+        if t.bitrate < bitrate_lim {
+            fails.push(format!("码率{:.0}kbps<{bitrate_lim:.0}", t.bitrate));
         }
         match t.cutoff {
             None => notes.push("截止频率未测出".into()),
-            Some(c) if c < CUTOFF_HZ => fails.push(format!("截止频率{:.1}kHz<15kHz", c / 1000.0)),
+            Some(c) if c < cutoff_lim => fails.push(format!(
+                "截止频率{:.1}kHz<{:.0}kHz",
+                c / 1000.0,
+                cutoff_lim / 1000.0
+            )),
             Some(_) => {}
         }
         let noise_lim = noise_limit_db(*role, cfg);
@@ -995,7 +1010,12 @@ pub fn check_song(group: &SongGroup, root: Option<&Path>, cfg: &Settings) -> Vec
             Some(nf) if nf >= noise_lim => fails.push(format!("底噪{nf:.1}dBFS高于{noise_lim}")),
             Some(_) => {}
         }
-        let rt60_cell = apply_rt60(t.rt60.as_ref(), &mut fails);
+        // 伴奏轨不测混响: 不判定, RT60 列留空
+        let rt60_cell = if *role == Role::Ins {
+            String::new()
+        } else {
+            apply_rt60(t.rt60.as_ref(), &mut fails)
+        };
 
         let cells = vec![
             name,
@@ -1463,5 +1483,12 @@ mod tests {
         assert_eq!(def.ins_noise_db, INS_NOISE_DBFS);
         assert_eq!(def.voc_noise_db, -40.0);
         assert_eq!(def.ins_noise_db, -40.0);
+    }
+
+    #[test]
+    fn spec_limits_relaxed_for_ins_only() {
+        assert_eq!(spec_limits(Role::Ins), (11000.0, 128.0));
+        assert_eq!(spec_limits(Role::Voc), (15000.0, 320.0));
+        assert_eq!(spec_limits(Role::Mix), (15000.0, 320.0), "合轨不跟伴奏放宽");
     }
 }
